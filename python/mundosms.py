@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "3.0.0"
+__version__ = "1.0.1"
 
 
 class MundoSMSError(Exception):
@@ -72,6 +72,7 @@ class MundoSMS:
             if data.get("next_cursor"):
                 filtros.pop("from_datetime", None)
                 filtros.pop("order", None)
+                filtros.pop("from_id", None)   # con el cursor, from_id sobra (y los dos a la vez dan 400)
                 filtros["cursor"] = data["next_cursor"]
             elif data.get("next_from_id") is not None:
                 filtros["from_id"] = data["next_from_id"]
@@ -87,7 +88,7 @@ class MundoSMS:
         if metodo in ("GET", "DELETE"):
             q = {}
             for k, v in datos.items():
-                if v is None:
+                if v is None or (isinstance(v, (list, tuple)) and not v):   # una lista vacía, como no mandarla
                     continue
                 q[k] = ("true" if v else "false") if isinstance(v, bool) else (",".join(map(str, v)) if isinstance(v, (list, tuple)) else str(v))
             query = urllib.parse.urlencode(q, quote_via=urllib.parse.quote)

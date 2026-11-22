@@ -16,7 +16,7 @@
 "use strict";
 const crypto = require("crypto");
 
-const VERSION = "3.0.0";
+const VERSION = "1.0.1";
 
 class MundoSMSError extends Error {
   constructor(mensaje, http = 0, statusCode = null, detail = null, respuesta = null) {
@@ -55,7 +55,7 @@ class MundoSMS {
       for (const e of lista ? data[lista] || [] : []) yield e;
       this.ultimoCursor = data.next_cursor ?? data.next_from_id ?? null;
       if (!data.has_more || !data.results) return;
-      if (data.next_cursor) { delete filtros.from_datetime; delete filtros.order; filtros.cursor = data.next_cursor; }
+      if (data.next_cursor) { delete filtros.from_datetime; delete filtros.order; delete filtros.from_id; filtros.cursor = data.next_cursor; }
       else if (data.next_from_id != null) filtros.from_id = data.next_from_id;
       else return;
     }
@@ -68,7 +68,7 @@ class MundoSMS {
     let query = "", cuerpo = "";
     if (metodo === "GET" || metodo === "DELETE") {
       query = Object.entries(datos || {})
-        .filter(([, v]) => v !== null && v !== undefined)
+        .filter(([, v]) => v !== null && v !== undefined && !(Array.isArray(v) && v.length === 0))   // una lista vacía, como no mandarla
         .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(typeof v === "boolean" ? String(v) : Array.isArray(v) ? v.join(",") : String(v)))
         .join("&");
     } else if (datos && Object.keys(datos).length) {

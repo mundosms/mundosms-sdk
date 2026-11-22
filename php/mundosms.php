@@ -34,7 +34,7 @@ class MundoSMSError extends Exception
 
 class MundoSMS
 {
-    const VERSION = "3.0.0";
+    const VERSION = "1.0.1";
 
     private $token;
     private $clave;
@@ -77,7 +77,7 @@ class MundoSMS
             foreach (($lista !== null ? ($data[$lista] ?? array()) : array()) as $e) yield $e;
             $this->ultimoCursor = $data["next_cursor"] ?? ($data["next_from_id"] ?? null);
             if (empty($data["has_more"]) || (int) ($data["results"] ?? 0) === 0) return;
-            if (isset($data["next_cursor"])) { unset($filtros["from_datetime"], $filtros["order"]); $filtros["cursor"] = $data["next_cursor"]; }
+            if (isset($data["next_cursor"])) { unset($filtros["from_datetime"], $filtros["order"], $filtros["from_id"]); $filtros["cursor"] = $data["next_cursor"]; }
             elseif (isset($data["next_from_id"])) $filtros["from_id"] = $data["next_from_id"];
             else return;
         }
@@ -96,7 +96,7 @@ class MundoSMS
         if ($metodo === "GET" || $metodo === "DELETE") {
             $q = array();
             foreach ($datos as $k => $v) {
-                if ($v === null) continue;
+                if ($v === null || (is_array($v) && !$v)) continue;   // una lista vacía, como no mandarla
                 $q[$k] = is_bool($v) ? ($v ? "true" : "false") : (is_array($v) ? implode(",", $v) : (string) $v);
             }
             $query = http_build_query($q, "", "&", PHP_QUERY_RFC3986);
