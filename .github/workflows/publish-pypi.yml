@@ -1,0 +1,64 @@
+# Publica el cliente Python (python/) en PyPI con Trusted Publishing (OIDC): sin tokens ni secretos.
+# - Una etiqueta vX.Y.Z construye, comprueba y publica. La etiqueta tiene que ser la versión de python/mundosms.py.
+# - Lanzado a mano (workflow_dispatch) desde una rama, solo construye y comprueba: no publica.
+name: Publicar en PyPI
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13.18"
+      - name: Herramientas
+        run: python -m pip install build==1.2.2.post1 twine==6.1.0
+      - name: La etiqueta es la versión del módulo
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(python -I -c "import ast; t=ast.parse(open('mundosms.py', encoding='utf-8').read()); print([n.value.value for n in t.body if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', '') == '__version__'][0])")
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then echo "La etiqueta $GITHUB_REF_NAME no es la versión de mundosms.py ($v)"; exit 1; fi
+      - name: Construir
+        run: python -m build
+      - name: Comprobar
+        run: |
+          python -m twine check --strict dist/*
+          python -m venv "$RUNNER_TEMP/prueba"
+          "$RUNNER_TEMP/prueba/bin/pip" install --no-index dist/*.whl
+          cd "$RUNNER_TEMP" && "$RUNNER_TEMP/prueba/bin/python" -I -c "import mundosms; print('mundosms', mundosms.__version__)"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: python/dist/
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mundosms-sdk
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/

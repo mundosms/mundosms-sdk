@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mundosms-sdk"
+dynamic = ["version"]
+description = "Cliente de la API REST v3 de MundoSMS: SMS, WhatsApp, centralita, VozPush y NumCheck. Firma cada petición y reintenta solo lo que es seguro repetir. Sin dependencias."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "MundoSMS" }]
+keywords = ["mundosms", "sms", "whatsapp", "voip", "click2dial", "centralita", "api", "sdk"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Communications :: Telephony",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.urls]
+Homepage = "https://www.mundosms.es/api-v3"
+Documentation = "https://www.mundosms.es/api-v3"
+Source = "https://github.com/mundosms/mundosms-sdk"
+Changelog = "https://github.com/mundosms/mundosms-sdk/blob/main/CHANGELOG.md"
+Issues = "https://github.com/mundosms/mundosms-sdk/issues"
+
+[tool.setuptools]
+py-modules = ["mundosms"]
+
+[tool.setuptools.dynamic]
+# la versión es la de mundosms.py (__version__)
+version = { attr = "mundosms.__version__" }
