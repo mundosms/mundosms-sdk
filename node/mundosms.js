@@ -16,7 +16,7 @@
 "use strict";
 const crypto = require("crypto");
 
-const VERSION = "1.0.1";
+const VERSION = "1.1.0";
 
 class MundoSMSError extends Error {
   constructor(mensaje, http = 0, statusCode = null, detail = null, respuesta = null) {
@@ -45,7 +45,7 @@ class MundoSMS {
   patch(ruta, datos) { return this.peticion("PATCH", ruta, datos); }
   delete(ruta, filtros = {}) { return this.peticion("DELETE", ruta, filtros); }
 
-  /** Recorre un listado entero, página a página, siguiendo su cursor (next_cursor o next_from_id), elemento a elemento. */
+  /** Recorre un listado entero, página a página, siguiendo su cursor (next_cursor), elemento a elemento. */
   async *todos(ruta, filtros = {}) {
     filtros = { ...filtros };
     let lista = null;
@@ -53,11 +53,10 @@ class MundoSMS {
       const data = (await this.get(ruta, filtros)).data || {};
       if (lista === null) lista = Object.keys(data).find((k) => Array.isArray(data[k])) || null;
       for (const e of lista ? data[lista] || [] : []) yield e;
-      this.ultimoCursor = data.next_cursor ?? data.next_from_id ?? null;
-      if (!data.has_more || !data.results) return;
-      if (data.next_cursor) { delete filtros.from_datetime; delete filtros.order; delete filtros.from_id; filtros.cursor = data.next_cursor; }
-      else if (data.next_from_id != null) filtros.from_id = data.next_from_id;
-      else return;
+      this.ultimoCursor = data.next_cursor ?? null;
+      if (!data.has_more || !data.results || !data.next_cursor) return;
+      delete filtros.from_datetime; delete filtros.order;
+      filtros.cursor = data.next_cursor;
     }
   }
 

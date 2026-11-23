@@ -22,7 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 
 class MundoSMSError(Exception):
@@ -57,7 +57,7 @@ class MundoSMS:
         return self.peticion("DELETE", ruta, filtros)
 
     def todos(self, ruta, filtros=None):
-        """Recorre un listado entero, página a página, siguiendo su cursor (next_cursor o next_from_id), elemento a elemento."""
+        """Recorre un listado entero, página a página, siguiendo su cursor (next_cursor), elemento a elemento."""
         filtros = dict(filtros or {})
         lista = None
         while True:
@@ -66,18 +66,12 @@ class MundoSMS:
                 lista = next((k for k, v in data.items() if isinstance(v, list)), None)
             for e in (data.get(lista) or []) if lista else []:
                 yield e
-            self.ultimo_cursor = data.get("next_cursor", data.get("next_from_id"))
-            if not data.get("has_more") or not data.get("results"):
+            self.ultimo_cursor = data.get("next_cursor")
+            if not data.get("has_more") or not data.get("results") or not data.get("next_cursor"):
                 return
-            if data.get("next_cursor"):
-                filtros.pop("from_datetime", None)
-                filtros.pop("order", None)
-                filtros.pop("from_id", None)   # con el cursor, from_id sobra (y los dos a la vez dan 400)
-                filtros["cursor"] = data["next_cursor"]
-            elif data.get("next_from_id") is not None:
-                filtros["from_id"] = data["next_from_id"]
-            else:
-                return
+            filtros.pop("from_datetime", None)
+            filtros.pop("order", None)
+            filtros["cursor"] = data["next_cursor"]
 
     def peticion(self, metodo, ruta, datos=None):
         """Una petición cualquiera. ruta: "/calls", "/numbers/34910123456"… Devuelve la respuesta decodificada."""

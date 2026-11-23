@@ -34,7 +34,7 @@ class MundoSMSError extends Exception
 
 class MundoSMS
 {
-    const VERSION = "1.0.1";
+    const VERSION = "1.1.0";
 
     private $token;
     private $clave;
@@ -62,7 +62,7 @@ class MundoSMS
     public function delete($ruta, array $filtros = array()) { return $this->peticion("DELETE", $ruta, $filtros); }
 
     /**
-     * Recorre un listado entero, página a página, siguiendo su cursor (next_cursor o next_from_id). Devuelve los elementos
+     * Recorre un listado entero, página a página, siguiendo su cursor (next_cursor). Devuelve los elementos
      * uno a uno. Para sincronizar, guarda tú el cursor con cursor(): la siguiente vez empiezas desde ahí.
      */
     public function todos($ruta, array $filtros = array())
@@ -75,11 +75,10 @@ class MundoSMS
                 foreach ($data as $k => $v) if (is_array($v) && array_is_list($v)) { $lista = $k; break; }
             }
             foreach (($lista !== null ? ($data[$lista] ?? array()) : array()) as $e) yield $e;
-            $this->ultimoCursor = $data["next_cursor"] ?? ($data["next_from_id"] ?? null);
-            if (empty($data["has_more"]) || (int) ($data["results"] ?? 0) === 0) return;
-            if (isset($data["next_cursor"])) { unset($filtros["from_datetime"], $filtros["order"], $filtros["from_id"]); $filtros["cursor"] = $data["next_cursor"]; }
-            elseif (isset($data["next_from_id"])) $filtros["from_id"] = $data["next_from_id"];
-            else return;
+            $this->ultimoCursor = $data["next_cursor"] ?? null;
+            if (empty($data["has_more"]) || (int) ($data["results"] ?? 0) === 0 || !isset($data["next_cursor"])) return;
+            unset($filtros["from_datetime"], $filtros["order"]);
+            $filtros["cursor"] = $data["next_cursor"];
         }
     }
 

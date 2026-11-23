@@ -1,5 +1,10 @@
 # Cambios
 
+## v1.1.0 — 23/11/2026
+
+- `todos()` sigue solo `next_cursor`: la API ya no devuelve `next_from_id` ni acepta `from_id`. Para empezar desde un
+  punto, pasa `cursor` (el `next_cursor` que guardaste).
+
 ## v1.0.1 — 23/11/2026
 
 - `todos()` con `from_id` fallaba en la segunda página (`400 Parameter cursor not valid`): seguía mandando `from_id` junto
