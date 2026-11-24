@@ -65,4 +65,5 @@ jobs:
         with:
           node-version: "24.22.0"
       - name: Publicar (OIDC, con procedencia)
-        run: npm publish dist/*.tgz --access public --provenance
+        # «./»: sin él, npm lee «dist/x.tgz» como un repositorio de GitHub (usuario/repo) y lo intenta clonar por ssh.
+        run: npm publish ./dist/*.tgz --access public --provenance

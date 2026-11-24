@@ -1,12 +1,21 @@
 # Publica el cliente Ruby (ruby/, gema mundosms) en RubyGems con Trusted Publishing (OIDC): sin API keys guardadas.
 # - Una etiqueta vX.Y.Z prueba, construye, comprueba y publica. La etiqueta tiene que ser la versión de ruby/lib/mundosms.rb.
-# - Lanzado a mano (workflow_dispatch) desde una rama, solo prueba, construye y comprueba: no publica.
+# - Lanzado a mano (workflow_dispatch) sin `etiqueta`, solo prueba, construye y comprueba la rama: no publica.
+# - Lanzado a mano con `etiqueta` (vX.Y.Z ya creada), construye la gema DESDE esa etiqueta y la publica: sirve para una versión
+#   cuya publicación en RubyGems falló, sin mover la etiqueta (los demás registros ya la tienen).
+# - La PRIMERA publicación de la gema (Trusted Publisher pendiente) necesita el ID de la cuenta dueña en RubyGems.org: la
+#   variable del repositorio RUBYGEMS_OWNER. Con la gema ya creada no hace falta y la variable se borra.
 name: Publicar en RubyGems
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      etiqueta:
+        description: "Etiqueta ya creada (vX.Y.Z) que publicar. Vacío: solo prueba y construye la rama."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -17,18 +26,26 @@ jobs:
     defaults:
       run:
         working-directory: ruby
+    env:
+      ETIQUETA: ${{ inputs.etiqueta || (startsWith(github.ref, 'refs/tags/v') && github.ref_name) || '' }}
     steps:
+      - name: La etiqueta pedida tiene forma de versión
+        if: inputs.etiqueta
+        working-directory: .
+        run: |
+          if ! printf '%s' "$ETIQUETA" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+'; then echo "etiqueta no válida: $ETIQUETA"; exit 1; fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.etiqueta && format('refs/tags/{0}', inputs.etiqueta) || github.ref }}
       - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
         with:
           ruby-version: "4.0.9"
       - name: La etiqueta es la versión de la gema
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: env.ETIQUETA != ''
         run: |
           v=$(ruby -e 'puts File.read("lib/mundosms.rb")[/^  VERSION = "([0-9.]+)"$/, 1]')
-          if [ "v$v" != "$GITHUB_REF_NAME" ]; then echo "La etiqueta $GITHUB_REF_NAME no es la versión de mundosms.rb ($v)"; exit 1; fi
+          if [ "v$v" != "$ETIQUETA" ]; then echo "La etiqueta $ETIQUETA no es la versión de mundosms.rb ($v)"; exit 1; fi
       - name: Pruebas
         run: ruby -w -Ilib test/test_mundosms.rb
       - name: Construir
@@ -44,7 +61,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.etiqueta
     needs: build
     runs-on: ubuntu-24.04
     environment:
@@ -61,6 +78,8 @@ jobs:
         with:
           ruby-version: "4.0.9"
       - name: Credenciales de RubyGems (OIDC, Trusted Publisher)
-        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+        uses: rubygems/configure-rubygems-credentials@c6ca7f4bac0e29c9bde8eeae0a0a986b27efa05f # v2.2.0
+        with:
+          owner: ${{ vars.RUBYGEMS_OWNER }}
       - name: Publicar
         run: gem push dist/mundosms-*.gem

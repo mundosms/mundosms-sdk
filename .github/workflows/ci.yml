@@ -1,6 +1,9 @@
 # Las pruebas de los siete clientes en cada PR y en cada push a main. Sin red hacia la API: cada una levanta su servidor de
 # prueba local, que comprueba la firma. Con la versión más vieja que promete cada cliente y con la de hoy, en sus imágenes
 # oficiales (fijadas). Solo lee el repositorio.
+# PHP, Python, Node, Java y Ruby: checkout en el runner y pruebas con `docker run`, sin red. Como job en contenedor no se
+# puede: esas imágenes no traen git, actions/checkout baja entonces el tarball de la API y el tarball aplica el
+# .gitattributes de la raíz (export-ignore: solo deja php/, para Composer), así que no llegan ni tests/ ni los clientes.
 name: Pruebas
 
 on:
@@ -19,12 +22,15 @@ jobs:
       fail-fast: false
       matrix:
         imagen: ["php:7.4.33-cli", "php:8.5.12-cli"]
-    container: ${{ matrix.imagen }}
+    env:
+      IMAGEN: ${{ matrix.imagen }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: php tests/php/test_mundosms.php
+      - name: Pruebas
+        run: |
+          docker run --rm --network none -v "$PWD:/w:ro" -w /w "$IMAGEN" php tests/php/test_mundosms.php
 
   python:
     runs-on: ubuntu-24.04
@@ -32,12 +38,15 @@ jobs:
       fail-fast: false
       matrix:
         imagen: ["python:3.9.25-slim", "python:3.13.18-slim"]
-    container: ${{ matrix.imagen }}
+    env:
+      IMAGEN: ${{ matrix.imagen }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: python3 -I tests/python/test_mundosms.py
+      - name: Pruebas
+        run: |
+          docker run --rm --network none -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/w:ro" -w /w "$IMAGEN" python3 -I tests/python/test_mundosms.py
 
   node:
     runs-on: ubuntu-24.04
@@ -45,12 +54,15 @@ jobs:
       fail-fast: false
       matrix:
         imagen: ["node:18.20.8-slim", "node:24.22.0-trixie-slim"]
-    container: ${{ matrix.imagen }}
+    env:
+      IMAGEN: ${{ matrix.imagen }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: node tests/node/test_mundosms.js
+      - name: Pruebas
+        run: |
+          docker run --rm --network none -v "$PWD:/w:ro" -w /w "$IMAGEN" node tests/node/test_mundosms.js
 
   java:
     runs-on: ubuntu-24.04
@@ -58,16 +70,18 @@ jobs:
       fail-fast: false
       matrix:
         imagen: ["eclipse-temurin:8u504-b01-jdk", "eclipse-temurin:21.0.12.1_1-jdk"]
-    container: ${{ matrix.imagen }}
+    env:
+      IMAGEN: ${{ matrix.imagen }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Compilar sin avisos y probar
         run: |
-          mkdir -p "$RUNNER_TEMP/c"
-          javac -encoding UTF-8 -Xlint:all -Xlint:-options -Werror -d "$RUNNER_TEMP/c" java/MundoSMS.java tests/java/MundoSMSTest.java
-          java -cp "$RUNNER_TEMP/c" MundoSMSTest
+          docker run --rm --network none -v "$PWD:/w:ro" -w /w "$IMAGEN" sh -ec '
+            mkdir -p /tmp/c
+            javac -encoding UTF-8 -Xlint:all -Xlint:-options -Werror -d /tmp/c java/MundoSMS.java tests/java/MundoSMSTest.java
+            java -cp /tmp/c MundoSMSTest'
 
   dotnet:
     runs-on: ubuntu-24.04
@@ -110,17 +124,16 @@ jobs:
       fail-fast: false
       matrix:
         imagen: ["ruby:3.1.7-slim", "ruby:4.0.9-slim"]
-    container: ${{ matrix.imagen }}
-    defaults:
-      run:
-        working-directory: ruby
+    env:
+      IMAGEN: ${{ matrix.imagen }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Pruebas, sin un aviso de Ruby
         run: |
-          ruby -w -Ilib test/test_mundosms.rb > "$RUNNER_TEMP/t.txt" 2>&1; r=$?
+          r=0
+          docker run --rm --network none -v "$PWD:/w:ro" -w /w/ruby "$IMAGEN" ruby -w -Ilib test/test_mundosms.rb > "$RUNNER_TEMP/t.txt" 2>&1 || r=$?
           cat "$RUNNER_TEMP/t.txt"
           if grep -q "warning:" "$RUNNER_TEMP/t.txt"; then echo "hay avisos de Ruby"; exit 1; fi
           exit $r
