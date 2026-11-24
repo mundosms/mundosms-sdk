@@ -4,7 +4,7 @@
 # - Lanzado a mano con `etiqueta` (vX.Y.Z ya creada), construye la gema DESDE esa etiqueta y la publica: sirve para una versión
 #   cuya publicación en RubyGems falló, sin mover la etiqueta (los demás registros ya la tienen).
 # - La PRIMERA publicación de la gema (Trusted Publisher pendiente) necesita el ID de la cuenta dueña en RubyGems.org: la
-#   variable del repositorio RUBYGEMS_OWNER. Con la gema ya creada no hace falta y la variable se borra.
+#   entrada `owner` del lanzamiento a mano (o la variable del repositorio RUBYGEMS_OWNER). Con la gema ya creada sobra.
 name: Publicar en RubyGems
 
 on:
@@ -14,6 +14,10 @@ on:
     inputs:
       etiqueta:
         description: "Etiqueta ya creada (vX.Y.Z) que publicar. Vacío: solo prueba y construye la rama."
+        required: false
+        default: ""
+      owner:
+        description: "Solo la primera publicación de la gema: el ID de la cuenta dueña en RubyGems.org."
         required: false
         default: ""
 
@@ -80,6 +84,6 @@ jobs:
       - name: Credenciales de RubyGems (OIDC, Trusted Publisher)
         uses: rubygems/configure-rubygems-credentials@c6ca7f4bac0e29c9bde8eeae0a0a986b27efa05f # v2.2.0
         with:
-          owner: ${{ vars.RUBYGEMS_OWNER }}
+          owner: ${{ inputs.owner || vars.RUBYGEMS_OWNER }}
       - name: Publicar
         run: gem push dist/mundosms-*.gem
