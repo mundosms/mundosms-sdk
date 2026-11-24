@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Paquete NuGet «MundoSMS»: el mismo MundoSMS.cs que se puede copiar suelto en un proyecto, compilado para:
+      net461          .NET Framework 4.6.1 o superior. Sin él, un proyecto de .NET Framework cogería la de netstandard2.0,
+                      que en 4.6.1-4.7.1 arrastra las fachadas de .NET Standard y el conflicto de versiones de System.Net.Http.
+      netstandard2.0  el resto (.NET Core 2.x, Mono, Xamarin, Unity…).
+      net6.0          .NET 6 o superior: añade AllAsync (IAsyncEnumerable).
+    Sin dependencias. Para empaquetar: dotnet pack -c Release (deja MundoSMS.1.0.0.nupkg en bin/Release).
+  -->
+
+  <PropertyGroup>
+    <TargetFrameworks>net461;netstandard2.0;net6.0</TargetFrameworks>
+    <AssemblyName>MundoSMS</AssemblyName>
+    <RootNamespace>MundoSMS</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <Deterministic>true</Deterministic>
+
+    <PackageId>MundoSMS</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>MundoSMS</Authors>
+    <Company>MundoSMS</Company>
+    <Product>MundoSMS</Product>
+    <Copyright>Copyright (c) 2026 MundoSMS</Copyright>
+    <Description>Cliente de la API REST v3 de MundoSMS (centralita, llamadas, SMS, VozPush, NumCheck y WhatsApp). Firma cada petición y reintenta solo lo que es seguro repetir. Sin dependencias.</Description>
+    <PackageTags>mundosms;sms;whatsapp;voip;centralita;api;rest</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://www.mundosms.es/api-v3</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/mundosms/mundosms-sdk</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>https://github.com/mundosms/mundosms-sdk/blob/main/CHANGELOG.md</PackageReleaseNotes>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <!-- el fuente: dotnet/MundoSMS.cs del repositorio (o MundoSMS.cs dos carpetas más arriba, junto a los otros clientes) -->
+  <ItemGroup>
+    <Compile Include="../../MundoSMS.cs" Condition="Exists('../../MundoSMS.cs')" />
+    <Compile Include="../../dotnet/MundoSMS.cs" Condition="!Exists('../../MundoSMS.cs')" />
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'net461'">
+    <Reference Include="System.Net.Http" />
+  </ItemGroup>
+
+</Project>

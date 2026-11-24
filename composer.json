@@ -1,0 +1,27 @@
+{
+    "name": "mundosms/sdk",
+    "description": "Cliente de la API REST v3 de MundoSMS: SMS, WhatsApp, centralita, VozPush y NumCheck. Firma cada petición y reintenta solo lo que es seguro repetir. Sin dependencias.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["mundosms", "sms", "whatsapp", "voip", "click2dial", "centralita", "api", "sdk"],
+    "homepage": "https://www.mundosms.es/api-v3",
+    "authors": [
+        {
+            "name": "MundoSMS",
+            "homepage": "https://www.mundosms.es"
+        }
+    ],
+    "support": {
+        "docs": "https://www.mundosms.es/api-v3",
+        "source": "https://github.com/mundosms/mundosms-sdk",
+        "issues": "https://github.com/mundosms/mundosms-sdk/issues"
+    },
+    "require": {
+        "php": ">=7.4",
+        "ext-curl": "*",
+        "ext-json": "*"
+    },
+    "autoload": {
+        "classmap": ["php/mundosms.php"]
+    }
+}
