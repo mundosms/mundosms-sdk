@@ -5,20 +5,27 @@
       net461          .NET Framework 4.6.1 o superior. Sin él, un proyecto de .NET Framework cogería la de netstandard2.0,
                       que en 4.6.1-4.7.1 arrastra las fachadas de .NET Standard y el conflicto de versiones de System.Net.Http.
       netstandard2.0  el resto (.NET Core 2.x, Mono, Xamarin, Unity…).
-      net6.0          .NET 6 o superior: añade AllAsync (IAsyncEnumerable).
-    Sin dependencias. Para empaquetar: dotnet pack -c Release (deja MundoSMS.1.0.0.nupkg en bin/Release).
+      net6.0          .NET 6 y 7: añade AllAsync (IAsyncEnumerable).
+      net8.0          .NET 8 o superior (con soporte): lo mismo que net6.0, compilado para el que se usa hoy.
+    Sin dependencias. Para empaquetar: dotnet pack -c Release (deja MundoSMS.1.2.0.nupkg en bin/Release). Un aviso del
+    compilador es un error (TreatWarningsAsErrors): el paquete se construye limpio o no se construye.
   -->
 
   <PropertyGroup>
-    <TargetFrameworks>net461;netstandard2.0;net6.0</TargetFrameworks>
+    <TargetFrameworks>net461;netstandard2.0;net6.0;net8.0</TargetFrameworks>
     <AssemblyName>MundoSMS</AssemblyName>
     <RootNamespace>MundoSMS</RootNamespace>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <Deterministic>true</Deterministic>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- PDB reproducible y con el commit (Source Link, que trae el SDK 8): en el workflow de GitHub, no en local -->
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
 
     <PackageId>MundoSMS</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.2.0</Version>
     <Authors>MundoSMS</Authors>
     <Company>MundoSMS</Company>
     <Product>MundoSMS</Product>
@@ -39,7 +46,8 @@
   <ItemGroup>
     <Compile Include="../../MundoSMS.cs" Condition="Exists('../../MundoSMS.cs')" />
     <Compile Include="../../dotnet/MundoSMS.cs" Condition="!Exists('../../MundoSMS.cs')" />
-    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <!-- el README del paquete, solo de C# y con enlaces absolutos (los relativos del general salen rotos en nuget.org) -->
+    <None Include="README.md" Pack="true" PackagePath="/" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'net461'">

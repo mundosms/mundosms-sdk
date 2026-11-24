@@ -1,0 +1,66 @@
+# Publica el cliente Ruby (ruby/, gema mundosms) en RubyGems con Trusted Publishing (OIDC): sin API keys guardadas.
+# - Una etiqueta vX.Y.Z prueba, construye, comprueba y publica. La etiqueta tiene que ser la versión de ruby/lib/mundosms.rb.
+# - Lanzado a mano (workflow_dispatch) desde una rama, solo prueba, construye y comprueba: no publica.
+name: Publicar en RubyGems
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: ruby
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "4.0.9"
+      - name: La etiqueta es la versión de la gema
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(ruby -e 'puts File.read("lib/mundosms.rb")[/^  VERSION = "([0-9.]+)"$/, 1]')
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then echo "La etiqueta $GITHUB_REF_NAME no es la versión de mundosms.rb ($v)"; exit 1; fi
+      - name: Pruebas
+        run: ruby -w -Ilib test/test_mundosms.rb
+      - name: Construir
+        run: gem build mundosms.gemspec
+      - name: Comprobar
+        run: |
+          gem install --local --no-document ./mundosms-*.gem
+          cd "$RUNNER_TEMP" && ruby -e 'require "mundosms"; puts "mundosms #{MundoSMS::VERSION}"'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gem
+          path: ruby/mundosms-*.gem
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: rubygems
+      url: https://rubygems.org/gems/mundosms
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: gem
+          path: dist/
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "4.0.9"
+      - name: Credenciales de RubyGems (OIDC, Trusted Publisher)
+        uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a # v2.1.0
+      - name: Publicar
+        run: gem push dist/mundosms-*.gem

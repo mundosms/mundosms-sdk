@@ -82,7 +82,12 @@ import javax.crypto.spec.SecretKeySpec;
  *
  * <p>Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un
  * POST con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como
- * mucho 60 s) o, si no lo trae, 1, 2, 4… s.
+ * mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho:
+ * vuelve como éxito, con data.changed {@code false}.
+ *
+ * <p>Una redirección (3xx) no se sigue nunca: es un {@link MundoSMSError} (la API no redirige). Un 2xx que no es JSON (el HTML
+ * de un proxy o de un portal cautivo) también es un error; los ficheros que da la API (audio, imagen, PDF) vuelven por su
+ * Content-Type.
  *
  * <p>Los avisos que te mandamos (callback_url y webhooks de WhatsApp) se comprueban con
  * {@link #verifyWebhook(String, String, byte[])}.
@@ -93,7 +98,7 @@ import javax.crypto.spec.SecretKeySpec;
 public class MundoSMS {
 
     /** La versión de este cliente: va también en el User-Agent. */
-    public static final String VERSION = "1.0.0";
+    public static final String VERSION = "1.2.0";
 
     /** Los segundos que puede alejarse de tu hora la «t» de la firma de un aviso, si no dices otra cosa. */
     public static final long WEBHOOK_TOLERANCE = 300;
@@ -124,6 +129,54 @@ public class MundoSMS {
     private final int retries;
     private final double timeout;
     private volatile String lastCursor;
+    private volatile RateLimit lastRateLimit;
+
+    /**
+     * El cupo que dijo una respuesta: sus cabeceras X-RateLimit-* ({@link #getLastRateLimit()}). Lo que no traía, -1.
+     */
+    public static final class RateLimit {
+        private final long limit;
+        private final long remaining;
+        private final long reset;
+
+        RateLimit(long limit, long remaining, long reset) {
+            this.limit = limit;
+            this.remaining = remaining;
+            this.reset = reset;
+        }
+
+        /**
+         * X-RateLimit-Limit: las peticiones por segundo que admite tu clave.
+         *
+         * @return el límite, o -1 si no lo traía
+         */
+        public long getLimit() {
+            return limit;
+        }
+
+        /**
+         * X-RateLimit-Remaining: las que te quedan en este segundo, contada esta.
+         *
+         * @return las que quedan, o -1 si no lo traía
+         */
+        public long getRemaining() {
+            return remaining;
+        }
+
+        /**
+         * X-RateLimit-Reset: los segundos que faltan para que se reponga el cupo.
+         *
+         * @return los segundos, o -1 si no lo traía
+         */
+        public long getReset() {
+            return reset;
+        }
+
+        @Override
+        public String toString() {
+            return "RateLimit{limit=" + limit + ", remaining=" + remaining + ", reset=" + reset + "}";
+        }
+    }
 
     /**
      * Opciones del cliente, para el tercer argumento del constructor:
@@ -370,7 +423,15 @@ public class MundoSMS {
     /**
      * Recorre un listado entero, página a página, siguiendo su cursor (next_cursor), elemento a elemento. Cada página lleva
      * los mismos filtros (y el mismo order) más el cursor. Las páginas se piden según se recorren, y cada recorrido empieza
-     * desde el principio. Al acabar, el último next_cursor queda en {@link #getLastCursor()}.
+     * desde el principio. Al acabar, el último next_cursor queda en {@link #getLastCursor()}, que avanza cuando ya te ha dado
+     * todos los elementos de una página: si tu código falla a mitad de una, sigue en la anterior.
+     *
+     * <p>Termina con has_more false (con stop_at_ongoing, también cuando la página se para en una llamada en curso), o si el
+     * cursor no avanza. Una página vacía con has_more true (con stop_at_ongoing y un filtro, cuando ha mirado muchas que no
+     * casan) no es el final: sigue.
+     *
+     * <p>Una lista que no va por páginas (GET /calls/missed y /calls/live: has_more sin next_cursor) no se puede recorrer
+     * entera: es un {@link MundoSMSError}, antes de ningún elemento. Sube limit, o filtra, y pídela con {@link #get(String, Map)}.
      *
      * @param path  la ruta del listado (sin /v3): "/calls", "/numbers"…
      * @param query los parámetros, o {@code null}
@@ -385,12 +446,24 @@ public class MundoSMS {
 
     /**
      * El cursor del último listado recorrido con {@link #all(String, Map)}: guárdalo y pásalo como cursor la próxima vez
-     * para pedir solo lo nuevo.
+     * para pedir solo lo nuevo. Al empezar el recorrido, el cursor que le pasas (o {@code null}); después, el último
+     * next_cursor que llegó (una página sin cursor no lo borra). Es uno por cliente: para dos recorridos a la vez, un cliente
+     * para cada uno.
      *
      * @return el último next_cursor, o {@code null}
      */
     public String getLastCursor() {
         return lastCursor;
+    }
+
+    /**
+     * El cupo que dijo la última respuesta (sus cabeceras X-RateLimit-*): con él, un bucle propio no se pasa de las 10
+     * peticiones por segundo (cuando {@code getRemaining()} llega a 0, espera {@code getReset()} segundos).
+     *
+     * @return el cupo, o {@code null} si la última respuesta no lo traía (o no hubo respuesta)
+     */
+    public RateLimit getLastRateLimit() {
+        return lastRateLimit;
     }
 
     /**
@@ -448,6 +521,7 @@ public class MundoSMS {
         // conexión. Pero en ese modo un 401 llega sin cuerpo: como un 401 no hizo nada, se pide otra vez sin streaming para
         // leer el error.
         boolean noStreaming = false;
+        boolean afterNetwork = false;   // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
         int attempt = 0;
         while (true) {
             attempt++;
@@ -463,11 +537,16 @@ public class MundoSMS {
             if (!privateKey.isEmpty()) headers.put("X-Signature", sign(token + "." + ts + "." + verb + " " + signedPath + "." + body));
             Response r = null;
             String networkError = null;
+            Throwable networkCause = null;
             try {
                 r = exchange(url, httpVerb, headers, bytes, !noStreaming);
             } catch (NetworkFailure e) {
-                if (e.interrupted) throw new MundoSMSError("No response from the API: " + e.getMessage());
+                if (e.interrupted) {
+                    lastRateLimit = null;
+                    throw withCause(new MundoSMSError("No response from the API: " + e.getMessage()), e.getCause());
+                }
                 networkError = e.getMessage();
+                networkCause = e.getCause();
             }
             int http = r == null ? 0 : r.http;   // si se cortó a medias, es un fallo de red aunque llegara la cabecera
             if (http == 401 && bytes != null && !noStreaming && r.body.length == 0) {
@@ -475,13 +554,32 @@ public class MundoSMS {
                 attempt--;
                 continue;
             }
-            Map<String, Object> j = r == null ? null : parseJsonObject(r.body);
+            boolean redirect = r != null && http >= 300 && http < 400;   // de una redirección no se lee nada
+            Map<String, Object> j = r == null || redirect ? null : parseJsonObject(r.body);
             if (retryable(verb, networkError != null, http, j, idemKey) && attempt <= retries
-                && pause(retryDelay(r == null ? null : r.retryAfter, attempt))) continue;
-            if (networkError != null) throw new MundoSMSError("No response from the API: " + networkError);
+                && pause(retryDelay(r == null ? null : r.retryAfter, attempt))) {
+                afterNetwork = afterNetwork || networkError != null || duplicated(http, j);
+                continue;
+            }
+            if (networkError != null) {
+                lastRateLimit = null;
+                throw withCause(new MundoSMSError("No response from the API: " + networkError), networkCause);
+            }
+            lastRateLimit = r.rateLimit;
+            if (redirect) {   // no se sigue: llevaría el token y la firma a otro servidor
+                String where = r.location == null || r.location.trim().isEmpty() ? ""
+                             : " to " + (r.location.trim().length() > 300 ? r.location.trim().substring(0, 300) : r.location.trim());
+                throw new MundoSMSError("HTTP " + http + ": redirect" + where + " not followed (the API does not redirect: check baseUrl)",
+                                        http, null, null, null, null, r.requestId);
+            }
             if (r.replayed && j != null) j.put("idempotent_replayed", Boolean.TRUE);   // la respuesta guardada de la primera vez
             if (http >= 200 && http < 300) {
-                if (j == null) {   // un fichero
+                if (j == null) {   // un fichero, o algo que no es de la API
+                    String type = r.contentType == null ? "" : r.contentType.split(";", 2)[0].trim();
+                    if (r.body.length > 0 && !isFileType(type)) {
+                        throw new MundoSMSError("HTTP " + http + ": the response is not JSON (" + (type.isEmpty() ? "no Content-Type" : type) + ")",
+                                                http, null, null, null, null, r.requestId);
+                    }
                     Map<String, Object> f = new LinkedHashMap<String, Object>();
                     f.put("status", "success");
                     f.put("content_type", r.contentType == null ? "" : r.contentType);
@@ -490,6 +588,19 @@ public class MundoSMS {
                     return f;
                 }
                 if (!"error".equals(j.get("status"))) return j;
+            }
+            if (verb.equals("DELETE") && afterNetwork && http == 404 && j != null
+                && !String.valueOf(j.get("message")).startsWith("Route not found")) {
+                // lo borró el intento que se quedó sin respuesta
+                Map<String, Object> d = new LinkedHashMap<String, Object>();
+                d.put("state", "deleted");
+                d.put("changed", Boolean.FALSE);
+                Map<String, Object> ok = new LinkedHashMap<String, Object>();
+                ok.put("status", "success");
+                ok.put("status_code", "0");
+                ok.put("message", "Already deleted");
+                ok.put("data", d);
+                return ok;
             }
             if (j != null) {
                 String message = asText(j.get("message"));
@@ -511,11 +622,28 @@ public class MundoSMS {
         // peticiones repetidas», esa copia da 409 Duplicated request (la MISMA petición firmada llegó dos veces): es un fallo
         // de red más, en cualquier método.
         Object message = j == null ? null : j.get("message");
-        network = network || (http == 409 && message instanceof String && ((String) message).startsWith("Duplicated request"));
+        network = network || duplicated(http, j);
         if (verb.equals("GET")) return network || http >= 500;
         if (verb.equals("PATCH") || verb.equals("DELETE")) return network;
         if (idemKey != null) return network || (http == 409 && "Request in progress".equals(message));
         return false;
+    }
+
+    /** 409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
+    private static boolean duplicated(int http, Map<String, Object> j) {
+        Object m = j == null ? null : j.get("message");
+        return http == 409 && m instanceof String && ((String) m).startsWith("Duplicated request");
+    }
+
+    /** Lo que la API da como fichero (grabaciones, locuciones, diagramas y el PDF de un certificado), por su Content-Type. */
+    private static boolean isFileType(String type) {
+        String t = type.toLowerCase(Locale.ROOT);
+        return t.startsWith("audio/") || t.startsWith("image/") || t.equals("application/pdf") || t.equals("application/octet-stream");
+    }
+
+    private static MundoSMSError withCause(MundoSMSError e, Throwable cause) {
+        if (cause != null) e.initCause(cause);
+        return e;
     }
 
     /** La Idempotency-Key, si tiene la forma que exige la API (de 1 a 64: A-Z a-z 0-9 _ . : -). */
@@ -768,14 +896,19 @@ public class MundoSMS {
         final String requestId;
         final byte[] body;
         final boolean replayed;   // Idempotent-Replayed: true
+        final String location;    // la de una redirección
+        final RateLimit rateLimit;
 
-        Response(int http, String contentType, String retryAfter, String requestId, byte[] body, boolean replayed) {
+        Response(int http, String contentType, String retryAfter, String requestId, byte[] body, boolean replayed, String location,
+                 RateLimit rateLimit) {
             this.http = http;
             this.contentType = contentType;
             this.retryAfter = retryAfter;
             this.requestId = requestId;
             this.body = body;
             this.replayed = replayed;
+            this.location = location;
+            this.rateLimit = rateLimit;
         }
     }
 
@@ -785,7 +918,11 @@ public class MundoSMS {
         final boolean interrupted;
 
         NetworkFailure(String message, boolean interrupted) {
-            super(message);
+            this(message, interrupted, null);
+        }
+
+        NetworkFailure(String message, boolean interrupted, Throwable cause) {
+            super(message, cause);
             this.interrupted = interrupted;
         }
     }
@@ -797,15 +934,22 @@ public class MundoSMS {
         private String listKey;
         private Iterator<?> page = Collections.emptyIterator();
         private boolean done;
+        private String pendingCursor;   // el next_cursor de la página en curso: pasa a lastCursor cuando se han dado todos sus elementos
 
         Pages(String path, Map<String, Object> query) {
             this.path = path;
             this.query = query;
+            Object start = query.get("cursor");   // el cursor de este recorrido: al empezar, el que le pasas
+            lastCursor = start == null || String.valueOf(start).isEmpty() ? null : String.valueOf(start);
         }
 
         @Override
         public boolean hasNext() {
             while (!page.hasNext()) {
+                if (pendingCursor != null) {
+                    lastCursor = pendingCursor;
+                    pendingCursor = null;
+                }
                 if (done) return false;
                 fetchNext();
             }
@@ -822,8 +966,16 @@ public class MundoSMS {
         }
 
         private void fetchNext() {
-            Object d = get(path, query).get("data");
+            Map<String, Object> r = get(path, query);
+            Object d = r.get("data");
             Map<?, ?> data = d instanceof Map ? (Map<?, ?>) d : Collections.emptyMap();
+            Object cursor = data.get("next_cursor");
+            if (truthy(data.get("has_more")) && truthy(data.get("results")) && !truthy(cursor)) {
+                done = true;
+                throw new MundoSMSError("MundoSMS: all() cannot go through " + path + ": it has more (has_more) but no next_cursor, so the list "
+                                        + "is not paginated: raise limit or narrow the filters, and read it with get()",
+                                        200, asText(r.get("status_code")), null, r, data, null);
+            }
             if (listKey == null) {   // la lista es el primer campo que es una lista: un objeto ({}) no lo es
                 for (Map.Entry<?, ?> e : data.entrySet()) {
                     if (e.getValue() instanceof List) {
@@ -834,9 +986,10 @@ public class MundoSMS {
             }
             Object l = listKey == null ? null : data.get(listKey);
             page = l instanceof List ? ((List<?>) l).iterator() : Collections.emptyIterator();
-            Object cursor = data.get("next_cursor");
-            lastCursor = cursor == null ? null : String.valueOf(cursor);
-            if (!truthy(data.get("has_more")) || !truthy(data.get("results")) || !truthy(cursor)) done = true;
+            if (truthy(cursor)) pendingCursor = String.valueOf(cursor);
+            Object sent = query.get("cursor");
+            if (!truthy(data.get("has_more")) || !truthy(cursor) || (sent != null && String.valueOf(sent).equals(String.valueOf(cursor)))
+                || truthy(data.get("ongoing_call"))) done = true;
             else query.put("cursor", cursor);
         }
     }
@@ -868,10 +1021,10 @@ public class MundoSMS {
             throw new NetworkFailure("the thread waiting for the response was interrupted", true);
         } catch (ExecutionException e) {
             Throwable c = e.getCause();
-            if (c instanceof SocketTimeoutException) throw new NetworkFailure("timed out after " + formatSeconds(timeout) + " s", false);
+            if (c instanceof SocketTimeoutException) throw new NetworkFailure("timed out after " + formatSeconds(timeout) + " s", false, c);
             if (c instanceof RuntimeException) throw (RuntimeException) c;
             if (c instanceof Error) throw (Error) c;
-            throw new NetworkFailure(reason(c), false);
+            throw new NetworkFailure(reason(c), false, c);
         }
     }
 
@@ -915,8 +1068,23 @@ public class MundoSMS {
             }
             complete = true;
             String replayed = c.getHeaderField("Idempotent-Replayed");
+            long[] rl = {-1, -1, -1};
+            boolean any = false;
+            String[] names = {"X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"};
+            for (int i = 0; i < 3; i++) {
+                String v = c.getHeaderField(names[i]);
+                try {
+                    if (v != null) {
+                        rl[i] = Long.parseLong(v.trim());
+                        any = true;
+                    }
+                } catch (NumberFormatException ignored) {
+                    // no es un número: como si no viniera
+                }
+            }
             return new Response(http, c.getContentType(), c.getHeaderField("Retry-After"), c.getHeaderField("X-Request-Id"), b.toByteArray(),
-                                replayed != null && replayed.trim().equalsIgnoreCase("true"));
+                                replayed != null && replayed.trim().equalsIgnoreCase("true"), c.getHeaderField("Location"),
+                                any ? new RateLimit(rl[0], rl[1], rl[2]) : null);
         } finally {
             if (!complete) c.disconnect();
         }
@@ -1057,16 +1225,16 @@ public class MundoSMS {
         return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
     }
 
-    /** Un parámetro de la query de la ruta, como lo lee un formulario: «+» es un espacio y %XX, su byte. */
+    /**
+     * Un parámetro de la query de la ruta: cada %XX, su byte; lo demás, también el «+», tal cual (RFC 3986: no es un
+     * formulario), para que una fecha con zona escrita en la ruta (from_datetime=…+01:00) llegue tal cual.
+     */
     private static String formDecode(String s) {
         ByteArrayOutputStream b = new ByteArrayOutputStream();
         int i = 0;
         while (i < s.length()) {
             char c = s.charAt(i);
-            if (c == '+') {
-                b.write(' ');
-                i++;
-            } else if (c == '%' && i + 2 < s.length() && hex(s.charAt(i + 1)) && hex(s.charAt(i + 2))) {
+            if (c == '%' && i + 2 < s.length() && hex(s.charAt(i + 1)) && hex(s.charAt(i + 2))) {
                 b.write(Integer.parseInt(s.substring(i + 1, i + 3), 16));
                 i += 3;
             } else {

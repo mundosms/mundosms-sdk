@@ -1,4 +1,4 @@
-"""MundoSMS API v3 — cliente Python en un solo fichero (Python 3.8 o superior). Sin dependencias.
+"""MundoSMS API v3 — cliente Python en un solo fichero (Python 3.9 o superior). Sin dependencias.
 Documentación: https://www.mundosms.es/api-v3
 Código y versiones: https://github.com/mundosms/mundosms-sdk (licencia MIT)
 
@@ -19,7 +19,11 @@ repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de
 "idempotent_replayed": True.
 Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
 con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como mucho
-60 s) o, si no lo trae, 1, 2, 4… s.
+60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
+como éxito, con data["changed"] False.
+Una redirección (3xx) no se sigue nunca: es un MundoSMSError (la API no redirige, y seguirla llevaría tu token y tu firma a
+otro servidor). Un 2xx que no es JSON (el HTML de un proxy o de un portal cautivo) también es un error; los ficheros que da
+la API (audio, imagen, PDF) vuelven por su Content-Type.
 Los avisos que te mandamos (callback_url y webhooks de WhatsApp) se comprueban con MundoSMS.verify_webhook().
 """
 import base64
@@ -37,10 +41,12 @@ import urllib.parse
 import urllib.request
 from email.utils import parsedate_to_datetime
 
-__version__ = "1.0.0"
+__version__ = "1.2.0"
 MAX_RETRY_WAIT = 60      # segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
 WEBHOOK_TOLERANCE = 300  # segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
 _IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,64}")   # la forma que exige la API para la Idempotency-Key
+_last_timestamp = 0                # el X-Timestamp de la última petición de este proceso (milisegundos)
+_timestamp_lock = threading.Lock()
 
 
 class MundoSMSError(Exception):
@@ -57,18 +63,30 @@ class MundoSMSError(Exception):
         self.data = data                 # el data de la respuesta (en WhatsApp, el id del mensaje que puede haber salido)
         self.request_id = request_id     # la cabecera X-Request-Id: con ella encuentras la petición en Logs API
 
+    def __reduce__(self):   # con pickle (Celery, multiprocessing), con todos sus campos y no solo el mensaje
+        return (self.__class__, (self.message, self.http, self.status_code, self.detail, self.response, self.data, self.request_id))
+
 
 class MundoSMS:
     def __init__(self, token, private_key="", *, base_url="https://api.mundosms.es/v3", retries=3, timeout=60):
         """token: el Token de tu API Key (empieza por eyJ); private_key: su clave privada si exige firma (lo normal), o "".
         retries: cuántas veces se reintenta lo que es seguro repetir (0, ninguna). timeout: los segundos que puede durar cada
-        petición entera (conectar, mandar y recibir la respuesta)."""
+        petición entera (conectar, mandar y recibir la respuesta). Un valor que no vale es un ValueError."""
+        base_url = base_url.rstrip("/")
+        u = urllib.parse.urlsplit(base_url)
+        if u.scheme not in ("https", "http") or not u.netloc or u.query or u.fragment:
+            raise ValueError("MundoSMS: base_url must be an http(s) address without query, like https://api.mundosms.es/v3")
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            raise ValueError("MundoSMS: retries must be an integer, 0 or more")
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout < float("inf")):
+            raise ValueError("MundoSMS: timeout must be a number of seconds greater than 0")
         self._token = token.strip()
         self._private_key = (private_key or "").strip()
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url
         self.retries = retries
         self.timeout = timeout
-        self.last_cursor = None   # el de all(): guárdalo para la siguiente sincronización
+        self.last_cursor = None       # el del último all(): guárdalo para la siguiente sincronización
+        self.last_rate_limit = None   # el cupo que dijo la última respuesta: {"limit", "remaining", "reset"}, o None
 
     def __repr__(self):
         return "MundoSMS(base_url=%r)" % self.base_url   # sin el token ni la clave: que no acaben en un log
@@ -92,20 +110,35 @@ class MundoSMS:
 
     def all(self, path, query=None):
         """Recorre un listado entero, página a página, siguiendo su cursor (next_cursor), elemento a elemento. Cada página
-        lleva los mismos filtros (y el mismo order) más el cursor. Para sincronizar, guarda tú last_cursor: la siguiente vez
-        empiezas desde ahí, pasándolo como cursor."""
+        lleva los mismos filtros (y el mismo order) más el cursor. Para sincronizar, guarda tú last_cursor al acabar: la
+        siguiente vez empiezas desde ahí, pasándolo como cursor. last_cursor es el de este recorrido: al empezar, el cursor
+        que le pasas (o None), y después el último next_cursor que llegó (una página sin cursor no lo borra). Es uno por
+        cliente: para dos recorridos a la vez, un cliente para cada uno. last_cursor avanza cuando ya te ha dado todos los
+        elementos de una página: si tu código falla a mitad de una, sigue en la anterior.
+        Termina con has_more false (con stop_at_ongoing, también cuando la página se para en una llamada en curso), o si el
+        cursor no avanza. Una página vacía con has_more true (con stop_at_ongoing y un filtro, cuando ha mirado muchas que no
+        casan) no es el final: sigue.
+        Una lista que no va por páginas (GET /calls/missed y /calls/live: has_more sin next_cursor) no se puede recorrer
+        entera: es un MundoSMSError, antes de dar nada. Sube limit, o filtra, y pídela con get()."""
         query = dict(query or {})
+        start = query.get("cursor")
+        self.last_cursor = None if start in (None, "") else start
         list_key = None
         while True:
-            data = self.get(path, query).get("data") or {}
+            r = self.get(path, query)
+            data = r.get("data") if isinstance(r.get("data"), dict) else {}
+            cursor = data.get("next_cursor")
+            if data.get("has_more") and data.get("results") and not cursor:
+                raise MundoSMSError(_NOT_PAGINATED % path, 200, r.get("status_code"), None, r, data)
             if list_key is None:
                 list_key = next((k for k, v in data.items() if isinstance(v, list)), None)
             for item in (data.get(list_key) or []) if list_key else []:
                 yield item
-            self.last_cursor = data.get("next_cursor")
-            if not data.get("has_more") or not data.get("results") or not data.get("next_cursor"):
+            if cursor:
+                self.last_cursor = cursor
+            if not data.get("has_more") or not cursor or cursor == query.get("cursor") or data.get("ongoing_call"):
                 return
-            query["cursor"] = data["next_cursor"]
+            query["cursor"] = cursor
 
     def request(self, method, path, data=None, *, idempotency_key=None):
         """Una petición cualquiera. path: "/calls", "/numbers/34910123456"… (sin /v3: si lo lleva, se quita). Si la ruta trae
@@ -121,15 +154,19 @@ class MundoSMS:
         if method in ("GET", "DELETE"):
             path_query.update(data)
         elif data:
-            body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            try:
+                body = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            except ValueError as e:   # NaN o infinito: no es JSON
+                raise ValueError("MundoSMS: the body cannot be encoded as JSON (nothing was sent): %s" % e) from None
         query = "&".join(_q(str(k)) + "=" + _q(t) for k, t in ((k, _query_value(v)) for k, v in path_query.items()) if t is not None)
         rest = encoded_path + ("?" + query if query else "")
         url = self.base_url + rest
         signed_path = base_path + rest   # lo que se firma es justo lo que se manda
         attempt = 0
+        after_network = False   # un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
         while True:
             attempt += 1
-            ts = str(int(time.time() * 1000))   # milisegundos: dos peticiones iguales seguidas no firman igual
+            ts = _timestamp()   # un reintento inmediato, o dos peticiones iguales a la vez, no firman igual
             headers = {"Authorization": "Bearer " + self._token, "X-Timestamp": ts, "Accept": "application/json",
                        "User-Agent": "MundoSMS-Python/" + __version__}
             if body:
@@ -145,7 +182,7 @@ class MundoSMS:
             deadline = _Deadline(self.timeout)
             try:
                 try:
-                    r = urllib.request.build_opener(_Http(deadline), _Https(deadline)).open(req, timeout=self.timeout)
+                    r = urllib.request.build_opener(_NoRedirect(), _Http(deadline), _Https(deadline)).open(req, timeout=self.timeout)
                 except urllib.error.HTTPError as e:
                     r = e
                 with r:
@@ -159,29 +196,41 @@ class MundoSMS:
             j = None
             if network_error:
                 http_ = 0   # se cortó a medias: es un fallo de red aunque llegara la cabecera
-            else:
+            elif not 300 <= http_ < 400:   # de una redirección no se lee nada
                 try:
                     j = json.loads(resp)
                 except ValueError:
                     j = None
+                if not isinstance(j, dict):
+                    j = None
             if _retryable(method, bool(network_error), http_, j, idem_key) and attempt <= self.retries:
+                after_network = after_network or bool(network_error) or _duplicated(http_, j)
                 time.sleep(_retry_wait(resp_headers.get("Retry-After"), attempt))
                 continue
             if network_error:
+                self.last_rate_limit = None
                 raise MundoSMSError("No response from the API: " + network_error)
+            self.last_rate_limit = _rate_limit(resp_headers)
+            rid = resp_headers.get("X-Request-Id")
+            if 300 <= http_ < 400:   # no se sigue: llevaría el token y la firma a otro servidor
+                raise MundoSMSError(_redirected(http_, resp_headers.get("Location")), http_, request_id=rid)
             replayed = str(resp_headers.get("Idempotent-Replayed", "")).strip().lower() == "true"
-            if replayed and isinstance(j, dict):
+            if replayed and j is not None:
                 j["idempotent_replayed"] = True   # la respuesta guardada de la primera vez: no se ha vuelto a hacer
             if 200 <= http_ < 300:
-                if not isinstance(j, dict):   # un fichero
-                    file = {"status": "success", "content_type": resp_headers.get("Content-Type", ""), "body": resp}
+                if j is None:   # un fichero, o algo que no es de la API
+                    content_type = resp_headers.get("Content-Type", "") or ""
+                    if resp and not _is_file(content_type):
+                        raise MundoSMSError(_not_json(http_, content_type), http_, request_id=rid)
+                    file = {"status": "success", "content_type": content_type, "body": resp}
                     if replayed:
                         file["idempotent_replayed"] = True
                     return file
                 if j.get("status") != "error":
                     return j
-            rid = resp_headers.get("X-Request-Id")
-            if isinstance(j, dict):
+            if method == "DELETE" and after_network and http_ == 404 and j is not None and not str(j.get("message", "")).startswith("Route not found"):
+                return _already_deleted()   # lo borró el intento que se quedó sin respuesta
+            if j is not None:
                 raise MundoSMSError(j.get("message", "Error"), http_, j.get("status_code"), j.get("detail"), j, j.get("data"), rid)
             raise MundoSMSError("HTTP %d" % http_, http_, request_id=rid)
 
@@ -191,6 +240,11 @@ class MundoSMS:
         secret: el de «API y Soporte → Webhooks» (whsec_…); header: X-MundoSMS-Signature; body: el cuerpo TAL CUAL llegó
         (bytes, o str en UTF-8), sin volver a serializar el JSON; tolerance: los segundos que puede alejarse «t» de tu hora.
         Una cabecera que falta o está mal formada da False, sin excepción."""
+        if isinstance(secret, (bytes, bytearray)):
+            try:
+                secret = bytes(secret).decode("utf-8")
+            except UnicodeDecodeError:
+                return False
         if isinstance(body, str):
             body = body.encode("utf-8")
         elif isinstance(body, (bytearray, memoryview)):
@@ -224,6 +278,60 @@ class MundoSMS:
         return valid
 
 
+_NOT_PAGINATED = ("MundoSMS: all() cannot go through %s: it has more (has_more) but no next_cursor, so the list is not paginated: "
+                  "raise limit or narrow the filters, and read it with get()")
+_FILE_TYPES = ("audio/", "image/")   # lo que la API da como fichero (grabaciones, locuciones, diagramas), y el PDF
+_FILE_TYPES_EXACT = ("application/pdf", "application/octet-stream")
+
+
+def _is_file(content_type):
+    """Si un 2xx que no es JSON es un fichero de la API (audio, imagen, PDF), por su Content-Type."""
+    t = content_type.split(";")[0].strip().lower()
+    return t.startswith(_FILE_TYPES) or t in _FILE_TYPES_EXACT
+
+
+def _not_json(http_, content_type):
+    return "HTTP %d: the response is not JSON (%s)" % (http_, content_type.split(";")[0].strip() or "no Content-Type")
+
+
+def _redirected(http_, location):
+    """El error de una redirección, con adónde mandaba (las redirecciones no se siguen: la API no redirige)."""
+    where = " to %s" % location.strip()[:300] if location else ""
+    return "HTTP %d: redirect%s not followed (the API does not redirect: check base_url)" % (http_, where)
+
+
+def _duplicated(http_, j):
+    """409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias)."""
+    return http_ == 409 and j is not None and str(j.get("message", "")).startswith("Duplicated request")
+
+
+def _already_deleted():
+    """La respuesta de un DELETE que se repitió tras quedarse sin respuesta y dio 404: lo borró el primer intento."""
+    return {"status": "success", "status_code": "0", "message": "Already deleted", "data": {"state": "deleted", "changed": False}}
+
+
+def _rate_limit(headers):
+    """El cupo de la respuesta (X-RateLimit-Limit, -Remaining y -Reset, en enteros), o None si no lo trae."""
+    out = {}
+    for k in ("limit", "remaining", "reset"):
+        v = headers.get("X-RateLimit-" + k.capitalize())
+        try:
+            out[k] = int(str(v).strip()) if v is not None else None
+        except ValueError:
+            out[k] = None
+    return out if any(v is not None for v in out.values()) else None
+
+
+def _timestamp():
+    """El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso (también desde varios
+    hilos). Dos peticiones iguales en el mismo milisegundo (un reintento tras un 429 con Retry-After: 0, o dos a la vez)
+    firmarían igual, y la API rechazaría la segunda por repetida («409 Duplicated request»)."""
+    global _last_timestamp
+    with _timestamp_lock:
+        _last_timestamp = max(int(time.time() * 1000), _last_timestamp + 1)
+        return str(_last_timestamp)
+
+
 def _idempotency_key(key, method):
     """La Idempotency-Key de la llamada: la tuya, si tiene la forma que exige la API; en un POST sin ella, un UUID v4 nuevo."""
     if key is None:
@@ -241,7 +349,7 @@ def _retryable(method, network, http_, j, idem_key):
     if http_ == 429:
         return True
     message = j.get("message") if isinstance(j, dict) else None
-    network = network or (http_ == 409 and isinstance(message, str) and message.startswith("Duplicated request"))
+    network = network or _duplicated(http_, j)
     if method == "GET":
         return network or http_ >= 500
     if method in ("PATCH", "DELETE"):
@@ -270,9 +378,14 @@ def _query_value(v):
 
 def _split_path(path, strip_v3):
     """La ruta codificada trozo a trozo (un %XX ya escrito se respeta), sin el /v3 del principio si la base ya lo lleva,
-    y los parámetros que traiga tras «?»."""
+    y los parámetros que traiga tras «?»: con su %XX decodificado y el «+» como «+» (RFC 3986; no es un formulario), para
+    que una fecha con zona escrita en la ruta (from_datetime=…+01:00) llegue tal cual."""
     path, _, query = str(path).partition("?")
-    path_query = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
+    path_query = {}
+    for pair in query.split("&"):
+        if pair:
+            k, _, v = pair.partition("=")
+            path_query[urllib.parse.unquote(k)] = urllib.parse.unquote(v)
     path = "/" + path.lstrip("/")
     if strip_v3 and (path == "/v3" or path.startswith("/v3/")):
         path = "/" + path[3:].lstrip("/")
@@ -353,6 +466,14 @@ class _Watched:
             c.connect = connect
             return c
         return super().do_open(open_conn, req, **kw)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Las redirecciones no se siguen: urllib las sigue por defecto, y al otro servidor le llegarían el token y la firma
+    (también de https a http). El 3xx llega como respuesta, y request() lo da como error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class _Http(_Watched, urllib.request.HTTPHandler):

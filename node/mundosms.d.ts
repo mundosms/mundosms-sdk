@@ -13,8 +13,9 @@
  *   const ok = MundoSMS.verifyWebhook("whsec_…", req.headers["x-mundosms-signature"], rawBody);   // un aviso que te llega
  */
 /// <reference types="node" />
+// (los tipos usan los de Node, Buffer y AbortSignal: en un proyecto de TypeScript, instala @types/node)
 
-/** Opciones del constructor (su tercer argumento). Una opción que no sea de estas da un `TypeError`. */
+/** Opciones del constructor (su tercer argumento). Una opción que no sea de estas, o un valor que no vale, da un `TypeError`. */
 export interface MundoSMSOptions {
   /** La dirección de la API. Por defecto, `https://api.mundosms.es/v3`. */
   baseUrl?: string;
@@ -99,9 +100,20 @@ export interface ErrorResponse {
   [field: string]: unknown;
 }
 
+/** El cupo que dijo la última respuesta (sus cabeceras `X-RateLimit-*`), en `MundoSMS.lastRateLimit`. */
+export interface RateLimit {
+  /** `X-RateLimit-Limit`: las peticiones por segundo que admite tu clave. */
+  limit: number | null;
+  /** `X-RateLimit-Remaining`: las que te quedan en este segundo, contada esta. */
+  remaining: number | null;
+  /** `X-RateLimit-Reset`: los segundos que faltan para que se reponga el cupo. */
+  reset: number | null;
+}
+
 /**
- * El error de cualquier petición: un 4xx o un 5xx, una respuesta 2xx con `"status": "error"` o, sin respuesta (la red o el
- * plazo agotado), `http` 0 y un mensaje que empieza por «No response from the API:».
+ * El error de cualquier petición: un 4xx o un 5xx, una redirección (no se siguen), una respuesta 2xx con `"status": "error"`
+ * o que no es JSON (el HTML de un proxy) o, sin respuesta (la red o el plazo agotado), `http` 0 y un mensaje que empieza por
+ * «No response from the API:» (y la causa en `cause`).
  */
 export declare class MundoSMSError extends Error {
   constructor(
@@ -126,6 +138,8 @@ export declare class MundoSMSError extends Error {
   data: any;
   /** La cabecera X-Request-Id: con ella encuentras la petición en Logs API. */
   requestId: string | null;
+  /** Sin respuesta: el error de red de debajo (el de `fetch`). */
+  cause?: unknown;
 }
 
 export declare class MundoSMS {
@@ -140,8 +154,13 @@ export declare class MundoSMS {
   baseUrl: string;
   retries: number;
   timeout: number;
-  /** El `next_cursor` de la última página que recorrió `all()`: guárdalo y pásalo como `cursor` la próxima vez. */
+  /**
+   * El cursor del último `all()`: al empezar, el `cursor` que le pasas (o `null`), y después el último `next_cursor` que
+   * llegó (una página sin cursor no lo borra). Guárdalo y pásalo como `cursor` la próxima vez. Uno por cliente.
+   */
   lastCursor: string | null;
+  /** El cupo que dijo la última respuesta (`X-RateLimit-*`), o `null` si no lo traía (o no hubo respuesta). */
+  lastRateLimit: RateLimit | null;
 
   /** GET: `query` va en la query. */
   get<T = any>(path: string, query?: QueryParams | null): Promise<Result<T>>;
@@ -157,7 +176,10 @@ export declare class MundoSMS {
 
   /**
    * Recorre un listado entero, página a página, siguiendo su `next_cursor`, y da los elementos uno a uno. Cada página lleva
-   * los mismos filtros (y el mismo `order`) más el cursor. `T` es el tipo de cada elemento.
+   * los mismos filtros (y el mismo `order`) más el cursor. `T` es el tipo de cada elemento. Termina con `has_more` false (con
+   * `stop_at_ongoing`, también cuando la página se para en una llamada en curso) o si el cursor no avanza: una página vacía con
+   * `has_more` true no es el final. `lastCursor` avanza cuando ya te ha dado todos los elementos de una página. Una lista que no va por páginas
+   * (`has_more` sin `next_cursor`: `/calls/missed`, `/calls/live`) es un `MundoSMSError`, antes de dar nada.
    */
   all<T = any>(path: string, query?: QueryParams | null): AsyncGenerator<T, void, undefined>;
 

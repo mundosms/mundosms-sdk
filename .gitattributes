@@ -1,0 +1,9 @@
+# Lo que deja fuera el zip de cada versión, el que hace GitHub (con export-ignore). Composer instala desde ese zip, así que
+# `composer require mundosms/sdk` baja solo el cliente de PHP: fuera va todo menos lo de las líneas -export-ignore.
+# El módulo de Go no cambia: Go hace su zip sin mirar export-ignore.
+/*              export-ignore
+/php            -export-ignore
+/composer.json  -export-ignore
+/README.md      -export-ignore
+/LICENSE        -export-ignore
+/CHANGELOG.md   -export-ignore

@@ -1,0 +1,128 @@
+# Publica el cliente Java (java/MundoSMS.java, paquete es.mundosms:mundosms-sdk) en Maven Central (Central Portal).
+# - Una etiqueta vX.Y.Z construye y prueba con Java 8 y 21 y, si la versión no está ya en Maven Central, firma con GPG, sube,
+#   publica (autoPublish) y espera a verla publicada (waitUntil=published). La etiqueta tiene que ser la <version> de
+#   paquetes/maven/pom.xml, que es también la VERSION de java/MundoSMS.java.
+# - Lanzado a mano (workflow_dispatch) desde una rama, solo construye y prueba: no firma ni sube.
+# Maven Central no deja repetir ni borrar una versión. Secretos del repositorio: MAVEN_CENTRAL_USERNAME y
+# MAVEN_CENTRAL_PASSWORD (el token del portal), MAVEN_GPG_PRIVATE_KEY (ASCII armor) y MAVEN_GPG_PASSPHRASE.
+name: Publicar en Maven Central
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        imagen:
+          - "maven:3.9.16-eclipse-temurin-8@sha256:0f402712b7a469189cfea5ec69cdcadcb32b22aaf1ea62777ab925c3d8470175"
+          - "maven:3.9.16-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320"
+    container: ${{ matrix.imagen }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: La etiqueta es la versión del pom (y la del cliente)
+        run: |
+          v=$(sed -n 's/^  <version>\([0-9.]*\)<\/version>$/\1/p' paquetes/maven/pom.xml)
+          vc=$(sed -n 's/^ *public static final String VERSION = "\([0-9.]*\)";.*/\1/p' java/MundoSMS.java)
+          if [ -z "$v" ] || [ "$v" != "$vc" ]; then echo "pom.xml dice «$v» y java/MundoSMS.java, «$vc»"; exit 1; fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "v$v" != "$GITHUB_REF_NAME" ]; then echo "La etiqueta $GITHUB_REF_NAME no es la versión de pom.xml ($v)"; exit 1; fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: Construir (el jar, el de fuentes y el de Javadoc)
+        run: mvn -B -ntp -f paquetes/maven/pom.xml verify
+      - name: Probar el jar construido
+        run: |
+          j="paquetes/maven/target/mundosms-sdk-$VERSION.jar"
+          mkdir -p "$RUNNER_TEMP/t"
+          javac -encoding UTF-8 -Xlint:all -Xlint:-options -Werror -cp "$j" -d "$RUNNER_TEMP/t" tests/java/MundoSMSTest.java
+          java -cp "$j:$RUNNER_TEMP/t" MundoSMSTest
+      - name: Comprobar los tres jar
+        run: |
+          d=paquetes/maven/target; n="mundosms-sdk-$VERSION"; mal=0
+          for f in "$n.jar:es/mundosms/MundoSMS.class" "$n.jar:META-INF/LICENSE" "$n-sources.jar:es/mundosms/MundoSMS.java" \
+                   "$n-javadoc.jar:index.html" "$n-javadoc.jar:es/mundosms/MundoSMS.html"; do
+            if jar tf "$d/${f%%:*}" | grep -q -x -F "${f#*:}"; then echo "  bien: ${f%%:*} lleva ${f#*:}"; else echo "  FALTA: ${f%%:*} sin ${f#*:}"; mal=1; fi
+          done
+          if javap -v -cp "$d/$n.jar" es.mundosms.MundoSMS | grep -q "major version: 52"; then echo "  bien: compilado para Java 8"; else echo "  MAL: no está compilado para Java 8"; mal=1; fi
+          exit $mal
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: contains(matrix.imagen, 'temurin-21')
+        with:
+          name: maven
+          path: paquetes/maven/target/mundosms-sdk-*.jar
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    container: "maven:3.9.16-eclipse-temurin-21@sha256:99e61abcff91a9b1333463bd8451fb18495d6eba9250ac66a338b518f8278320"
+    timeout-minutes: 75
+    environment:
+      name: maven
+      url: https://central.sonatype.com/artifact/es.mundosms/mundosms-sdk
+    env:
+      # la clave que firma: la publicada en keyserver.ubuntu.com y keys.openpgp.org, contra la que Central comprueba las firmas
+      CLAVE_GPG: EF8532686E0790FA388BED51589AB4ED828A10B4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Que la versión no esté ya en Maven Central
+        run: |
+          v=$(sed -n 's/^  <version>\([0-9.]*\)<\/version>$/\1/p' paquetes/maven/pom.xml)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then echo "La etiqueta $GITHUB_REF_NAME no es la versión de pom.xml ($v)"; exit 1; fi
+          url="https://repo1.maven.org/maven2/es/mundosms/mundosms-sdk/$v/mundosms-sdk-$v.pom"
+          c=$(curl -sS -o /dev/null -w '%{http_code}' --retry 3 --max-time 30 "$url") || c="sin respuesta"
+          case "$c" in
+            404) echo "es.mundosms:mundosms-sdk:$v no está en Maven Central: se sube";;
+            200) echo "es.mundosms:mundosms-sdk:$v YA está en Maven Central, que no admite repetir una versión: no se sube nada"; exit 1;;
+            *) echo "No se sabe si es.mundosms:mundosms-sdk:$v está ya en Maven Central ($url: $c): no se sube nada"; exit 1;;
+          esac
+      - name: Firmar, subir y publicar
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          MAVEN_GPG_PRIVATE_KEY: ${{ secrets.MAVEN_GPG_PRIVATE_KEY }}
+          MAVEN_GPG_PASSPHRASE: ${{ secrets.MAVEN_GPG_PASSPHRASE }}
+        run: |
+          set -eu
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          trap 'gpgconf --kill gpg-agent 2>/dev/null || true; rm -rf "$GNUPGHOME" "$RUNNER_TEMP/settings.xml"' EXIT
+          mkdir -m 700 "$GNUPGHOME"
+          for s in MAVEN_CENTRAL_USERNAME MAVEN_CENTRAL_PASSWORD MAVEN_GPG_PRIVATE_KEY MAVEN_GPG_PASSPHRASE; do
+            if [ -z "$(printenv "$s")" ]; then echo "Falta el secreto $s en el repositorio"; exit 1; fi
+          done
+          # la clave privada, al llavero de este job (nunca a la salida); se borra al acabar
+          printf '%s\n' "$MAVEN_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          unset MAVEN_GPG_PRIVATE_KEY
+          fpr=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')
+          if [ "$fpr" != "$CLAVE_GPG" ]; then echo "MAVEN_GPG_PRIVATE_KEY no es la clave publicada $CLAVE_GPG (es «$fpr»)"; exit 1; fi
+          # el servidor «central» del pom: el settings.xml no lleva el token, lo lee Maven de las variables de entorno
+          cat > "$RUNNER_TEMP/settings.xml" <<'EOF'
+          <settings>
+            <servers>
+              <server>
+                <id>central</id>
+                <username>${env.MAVEN_CENTRAL_USERNAME}</username>
+                <password>${env.MAVEN_CENTRAL_PASSWORD}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
+          # firma (la frase, de MAVEN_GPG_PASSPHRASE, en loopback), sube, publica y espera a que Central diga PUBLISHED
+          mvn -B -ntp -s "$RUNNER_TEMP/settings.xml" -f paquetes/maven/pom.xml -P publicar -Dgpg.keyname="$CLAVE_GPG" deploy
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: central-bundle
+          path: paquetes/maven/target/central-publishing/central-bundle.zip
+          if-no-files-found: ignore

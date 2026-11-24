@@ -20,7 +20,11 @@
  * "idempotent_replayed" => true.
  * Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
  * con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como mucho
- * 60 s) o, si no lo trae, 1, 2, 4… s.
+ * 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
+ * como éxito, con data["changed"] false.
+ * Una redirección (3xx) no se sigue nunca: es un MundoSMSError (la API no redirige). Un 2xx que no es JSON (el HTML de un
+ * proxy o de un portal cautivo) también es un error; los ficheros que da la API (audio, imagen, PDF) vuelven por su
+ * Content-Type.
  * Los avisos que te mandamos (callback_url y webhooks de WhatsApp) se comprueban con MundoSMS::verifyWebhook().
  */
 
@@ -53,9 +57,13 @@ class MundoSMSError extends Exception
 
 class MundoSMS
 {
-    const VERSION = "1.0.0";
+    const VERSION = "1.2.0";
     const MAX_RETRY_WAIT = 60;      // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
     const WEBHOOK_TOLERANCE = 300;  // segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
+    const NOT_PAGINATED = "MundoSMS: all() cannot go through %s: it has more (has_more) but no next_cursor, so the list is not paginated: raise limit or narrow the filters, and read it with get()";
+
+    /** @var int el X-Timestamp de la última petición de este proceso (milisegundos): el siguiente siempre es mayor */
+    private static $lastTimestamp = 0;
 
     private $token;
     private $privateKey;
@@ -63,14 +71,26 @@ class MundoSMS
     private $retries;
     private $timeout;
 
-    /** El cursor del último listado recorrido con all(): guárdalo para la siguiente sincronización. */
+    /**
+     * El cursor del último listado recorrido con all(): guárdalo para la siguiente sincronización. Al empezar el recorrido, el
+     * cursor que le pasas (o null); después, el último next_cursor que llegó (una página sin cursor no lo borra).
+     * @var string|null
+     */
     public $lastCursor = null;
+
+    /**
+     * El cupo que dijo la última respuesta (sus cabeceras X-RateLimit-*): ["limit" => 10, "remaining" => 7, "reset" => 1], o
+     * null si no lo traía (o no hubo respuesta).
+     * @var array{limit: int|null, remaining: int|null, reset: int|null}|null
+     */
+    public $lastRateLimit = null;
 
     /**
      * @param string $token       el Token de tu API Key (empieza por eyJ)
      * @param string $privateKey  su clave privada si la API Key exige firma (lo normal); "" si no
      * @param array  $options     baseUrl (https://api.mundosms.es/v3), retries (3) y timeout: los segundos que puede durar
      *                            cada petición entera, con decimales si quieres (60)
+     * @throws InvalidArgumentException con una opción que no existe o un valor que no vale
      */
     public function __construct(
         #[\SensitiveParameter]
@@ -84,49 +104,94 @@ class MundoSMS
                 throw new InvalidArgumentException('MundoSMS: unknown option "' . $k . '" (options: baseUrl, retries, timeout)');
             }
         }
+        $baseUrl = rtrim((string) ($options["baseUrl"] ?? "https://api.mundosms.es/v3"), "/");
+        $u = parse_url($baseUrl);
+        if (!is_array($u) || !in_array(strtolower($u["scheme"] ?? ""), array("https", "http"), true) || ($u["host"] ?? "") === ""
+            || isset($u["query"]) || isset($u["fragment"])) {
+            throw new InvalidArgumentException("MundoSMS: baseUrl must be an http(s) address without query, like https://api.mundosms.es/v3");
+        }
+        $retries = $options["retries"] ?? 3;   // un número o un texto con el número («5» de un fichero de configuración)
+        if (is_bool($retries) || filter_var($retries, FILTER_VALIDATE_INT, array("options" => array("min_range" => 0))) === false) {
+            throw new InvalidArgumentException("MundoSMS: retries must be an integer, 0 or more");
+        }
+        $timeout = $options["timeout"] ?? 60;
+        if (!is_numeric($timeout) || !((float) $timeout > 0) || is_infinite((float) $timeout)) {
+            throw new InvalidArgumentException("MundoSMS: timeout must be a number of seconds greater than 0");
+        }
+        $retries = (int) $retries;
         $this->token = trim((string) $token);
         $this->privateKey = trim((string) $privateKey);
-        $this->baseUrl = rtrim((string) ($options["baseUrl"] ?? "https://api.mundosms.es/v3"), "/");
-        $this->retries = (int) ($options["retries"] ?? 3);
-        $this->timeout = (float) ($options["timeout"] ?? 60);
+        $this->baseUrl = $baseUrl;
+        $this->retries = $retries;
+        $this->timeout = (float) $timeout;
     }
 
     /** Lo que enseñan var_dump() y print_r(): sin el token ni la clave privada, para que no acaben en un log. */
     public function __debugInfo()
     {
-        return array("baseUrl" => $this->baseUrl, "retries" => $this->retries, "timeout" => $this->timeout, "lastCursor" => $this->lastCursor);
+        return array("baseUrl" => $this->baseUrl, "retries" => $this->retries, "timeout" => $this->timeout, "lastCursor" => $this->lastCursor,
+                     "lastRateLimit" => $this->lastRateLimit);
     }
 
-    /** GET: $query va en la query. */
+    /**
+     * GET: $query va en la query.
+     * @return array<string, mixed> la respuesta entera
+     * @throws MundoSMSError
+     */
     public function get($path, array $query = array()) { return $this->request("GET", $path, $query); }
     /**
      * POST: $data va en un cuerpo JSON. $options: ["idempotencyKey" => "pedido-881"], tu clave para que repetir este POST no
-     * lo vuelva a hacer; sin ella, un UUID nuevo.
+     * lo vuelva a hacer; sin ella, un UUID nuevo. Un objeto JSON vacío, como new stdClass (un array vacío sale como []).
+     * @return array<string, mixed> la respuesta entera
+     * @throws MundoSMSError
      */
     public function post($path, array $data = array(), array $options = array()) { return $this->request("POST", $path, $data, $options); }
-    /** PATCH: $data va en un cuerpo JSON. */
+    /**
+     * PATCH: $data va en un cuerpo JSON.
+     * @return array<string, mixed> la respuesta entera
+     * @throws MundoSMSError
+     */
     public function patch($path, array $data) { return $this->request("PATCH", $path, $data); }
-    /** DELETE: $query va en la query. */
+    /**
+     * DELETE: $query va en la query.
+     * @return array<string, mixed> la respuesta entera
+     * @throws MundoSMSError
+     */
     public function delete($path, array $query = array()) { return $this->request("DELETE", $path, $query); }
 
     /**
      * Recorre un listado entero, página a página, siguiendo su cursor (next_cursor). Devuelve los elementos uno a uno. Cada
-     * página lleva los mismos filtros (y el mismo order) más el cursor. Para sincronizar, guarda tú el cursor con lastCursor:
-     * la siguiente vez empiezas desde ahí, pasándolo como cursor.
+     * página lleva los mismos filtros (y el mismo order) más el cursor. Para sincronizar, guarda tú el cursor con lastCursor
+     * al acabar: la siguiente vez empiezas desde ahí, pasándolo como cursor. lastCursor es uno por cliente: para dos
+     * recorridos a la vez, un cliente para cada uno. lastCursor avanza cuando ya te ha dado todos los elementos de una página:
+     * si tu código falla a mitad de una, sigue en la anterior.
+     * Termina con has_more false (con stop_at_ongoing, también cuando la página se para en una llamada en curso), o si el
+     * cursor no avanza. Una página vacía con has_more true (con stop_at_ongoing y un filtro, cuando ha mirado muchas que no
+     * casan) no es el final: sigue.
+     * Una lista que no va por páginas (GET /calls/missed y /calls/live: has_more sin next_cursor) no se puede recorrer entera:
+     * es un MundoSMSError, antes de dar nada. Sube limit, o filtra, y pídela con get().
+     * @return \Generator<int, array<string, mixed>> los elementos
+     * @throws MundoSMSError
      */
     public function all($path, array $query = array())
     {
+        $this->lastCursor = (isset($query["cursor"]) && $query["cursor"] !== "") ? $query["cursor"] : null;
         $listKey = null;
         while (true) {
             $r = $this->get($path, $query);
             $data = is_array($r["data"] ?? null) ? $r["data"] : array();
+            $cursor = $data["next_cursor"] ?? null;
+            if (!empty($data["has_more"]) && !empty($data["results"]) && ($cursor === null || $cursor === "")) {
+                throw new MundoSMSError(sprintf(self::NOT_PAGINATED, $path), 200, $r["status_code"] ?? null, null, $r, $data);
+            }
             if ($listKey === null) {   // la lista es el primer campo con elementos: un objeto vacío ({}) también llega como array()
-                foreach ($data as $k => $v) if (is_array($v) && $v && array_is_list($v)) { $listKey = $k; break; }
+                foreach ($data as $k => $v) if (is_array($v) && $v && self::isList($v)) { $listKey = $k; break; }
             }
             foreach (($listKey !== null && is_array($data[$listKey] ?? null)) ? $data[$listKey] : array() as $item) yield $item;
-            $this->lastCursor = $data["next_cursor"] ?? null;
-            if (empty($data["has_more"]) || (int) ($data["results"] ?? 0) === 0 || !isset($data["next_cursor"])) return;
-            $query["cursor"] = $data["next_cursor"];
+            if ($cursor !== null && $cursor !== "") $this->lastCursor = $cursor;
+            if (empty($data["has_more"]) || $cursor === null || $cursor === "" || $cursor === ($query["cursor"] ?? null)
+                || !empty($data["ongoing_call"])) return;
+            $query["cursor"] = $cursor;
         }
     }
 
@@ -135,6 +200,9 @@ class MundoSMS
      * "?…", esos parámetros se juntan con $data (gana $data). En GET y DELETE, $data va en la query; en POST y PATCH, en el
      * cuerpo JSON. Devuelve la respuesta decodificada.
      * $options: "idempotencyKey", la Idempotency-Key (en un POST, sin ella, un UUID nuevo); la API la tiene en cuenta en los POST.
+     * @return array<string, mixed> la respuesta entera (un fichero: status, content_type y body)
+     * @throws MundoSMSError si la API contesta con un error, redirige, no contesta en JSON o no contesta
+     * @throws InvalidArgumentException si los datos no se pueden mandar (no se manda nada)
      */
     public function request($method, $path, array $data = array(), array $options = array())
     {
@@ -162,9 +230,10 @@ class MundoSMS
         $signedPath = $basePath . $rest;   // lo que se firma es justo lo que se manda
         $ms = (int) ceil($this->timeout * 1000);
         $attempt = 0;
+        $afterNetwork = false;   // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
         while (true) {
             $attempt++;
-            $ts = (string) (int) round(microtime(true) * 1000);   // milisegundos: dos peticiones iguales seguidas no firman igual
+            $ts = self::timestamp();   // un reintento inmediato no firma igual que el intento de antes
             $headers = array("Authorization: Bearer " . $this->token, "X-Timestamp: " . $ts, "Accept: application/json",
                              "User-Agent: MundoSMS-PHP/" . self::VERSION);
             if ($body !== "") $headers[] = "Content-Type: application/json";
@@ -190,27 +259,51 @@ class MundoSMS
             if ($networkError !== "" && curl_errno($ch) === 28) $networkError = "timed out after " . $this->timeout . " s";   // CURLE_OPERATION_TIMEDOUT: el mismo texto que los otros SDK
             unset($ch);   // sin curl_close(): no hace nada desde PHP 8.0 y en 8.5 deja un «Deprecated» por petición
             if ($networkError !== "") $http = 0;   // se cortó a medias: es un fallo de red aunque llegara la cabecera
-            $j = ($resp !== false && $networkError === "") ? json_decode((string) $resp, true) : null;
+            $redirect = $networkError === "" && $http >= 300 && $http < 400;   // de una redirección no se lee nada
+            $j = ($resp !== false && $networkError === "" && !$redirect) ? json_decode((string) $resp, true) : null;
+            if (!is_array($j) || ($j !== array() && self::isList($j))) $j = null;   // solo un objeto JSON es de la API
             if (self::retryable($method, $networkError !== "", $http, $j, $idemKey) && $attempt <= $this->retries) {
+                $afterNetwork = $afterNetwork || $networkError !== "" || self::duplicated($http, $j);
                 $s = self::retryWait($respHeaders["retry-after"] ?? null, $attempt);
                 if ($s >= 1) sleep((int) $s);
                 usleep((int) round(($s - floor($s)) * 1000000));
                 continue;
             }
-            if ($networkError !== "") throw new MundoSMSError("No response from the API: " . $networkError);
+            if ($networkError !== "") {
+                $this->lastRateLimit = null;
+                throw new MundoSMSError("No response from the API: " . $networkError);
+            }
+            $this->lastRateLimit = self::rateLimit($respHeaders);
+            $rid = $respHeaders["x-request-id"] ?? null;
+            if ($redirect) {   // no se sigue: llevaría el token y la firma a otro servidor
+                $where = isset($respHeaders["location"]) ? " to " . substr($respHeaders["location"], 0, 300) : "";
+                throw new MundoSMSError("HTTP " . $http . ": redirect" . $where . " not followed (the API does not redirect: check baseUrl)",
+                                        $http, null, null, null, null, $rid);
+            }
             $replayed = strtolower(trim((string) ($respHeaders["idempotent-replayed"] ?? ""))) === "true";
             if ($replayed && is_array($j)) $j["idempotent_replayed"] = true;   // la respuesta guardada de la primera vez: no se ha vuelto a hacer
             if ($http >= 200 && $http < 300) {
-                if (!is_array($j)) {   // un fichero
+                if (!is_array($j)) {   // un fichero, o algo que no es de la API
+                    $type = trim(explode(";", $contentType)[0]);
+                    if ((string) $resp !== "" && !preg_match('#\A(audio/|image/|application/pdf\z|application/octet-stream\z)#i', $type)) {
+                        throw new MundoSMSError("HTTP " . $http . ": the response is not JSON (" . ($type !== "" ? $type : "no Content-Type") . ")",
+                                                $http, null, null, null, null, $rid);
+                    }
                     $file = array("status" => "success", "content_type" => $contentType, "body" => (string) $resp);
                     if ($replayed) $file["idempotent_replayed"] = true;
                     return $file;
                 }
                 if (($j["status"] ?? null) !== "error") return $j;
             }
+            if ($method === "DELETE" && $afterNetwork && $http === 404 && is_array($j)
+                && strncmp((string) ($j["message"] ?? ""), "Route not found", 15) !== 0) {
+                // lo borró el intento que se quedó sin respuesta
+                return array("status" => "success", "status_code" => "0", "message" => "Already deleted",
+                             "data" => array("state" => "deleted", "changed" => false));
+            }
             throw new MundoSMSError(is_array($j) ? (string) ($j["message"] ?? "Error") : "HTTP " . $http, $http,
                                     is_array($j) ? ($j["status_code"] ?? null) : null, is_array($j) ? ($j["detail"] ?? null) : null, $j,
-                                    is_array($j) ? ($j["data"] ?? null) : null, $respHeaders["x-request-id"] ?? null);
+                                    is_array($j) ? ($j["data"] ?? null) : null, $rid);
         }
     }
 
@@ -259,6 +352,17 @@ class MundoSMS
         return $valid;
     }
 
+    /**
+     * El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso. Un reintento que sale
+     * en el mismo milisegundo (un 429 con Retry-After: 0) firmaría igual que el intento de antes, y la API lo rechazaría por
+     * repetido («409 Duplicated request»).
+     */
+    private static function timestamp()
+    {
+        self::$lastTimestamp = max((int) round(microtime(true) * 1000), self::$lastTimestamp + 1);
+        return (string) self::$lastTimestamp;
+    }
+
     /** La Idempotency-Key de la llamada: la tuya, si tiene la forma que exige la API; en un POST sin ella, un UUID v4 nuevo. */
     private static function idempotencyKey(array $options, $method)
     {
@@ -290,16 +394,42 @@ class MundoSMS
     {
         if ($http === 429) return true;
         $message = (is_array($j) && is_string($j["message"] ?? null)) ? $j["message"] : null;
-        $network = $network || ($http === 409 && $message !== null && strncmp($message, "Duplicated request", 18) === 0);
+        $network = $network || self::duplicated($http, $j);
         if ($method === "GET") return $network || $http >= 500;
         if ($method === "PATCH" || $method === "DELETE") return $network;
         if ($idemKey !== null) return $network || ($http === 409 && $message === "Request in progress");
         return false;
     }
 
+    /** 409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
+    private static function duplicated($http, $j)
+    {
+        return $http === 409 && is_array($j) && is_string($j["message"] ?? null) && strncmp($j["message"], "Duplicated request", 18) === 0;
+    }
+
+    /** El cupo de la respuesta (X-RateLimit-Limit, -Remaining y -Reset, en enteros), o null si no lo trae. */
+    private static function rateLimit(array $headers)
+    {
+        $out = array();
+        $any = false;
+        foreach (array("limit", "remaining", "reset") as $k) {
+            $v = isset($headers["x-ratelimit-" . $k]) ? trim($headers["x-ratelimit-" . $k]) : null;
+            $out[$k] = ($v !== null && preg_match('/\A-?[0-9]{1,18}\z/', $v)) ? (int) $v : null;
+            if ($out[$k] !== null) $any = true;
+        }
+        return $any ? $out : null;
+    }
+
+    /** Si un array es una lista (0, 1, 2…): array_is_list de PHP 8.1, también en 7.4. */
+    private static function isList(array $a)
+    {
+        return $a === array() || array_keys($a) === range(0, count($a) - 1);
+    }
+
     /**
      * La ruta codificada trozo a trozo (un %XX ya escrito se respeta), sin el /v3 del principio si la base ya lo lleva,
-     * y los parámetros que traiga tras «?».
+     * y los parámetros que traiga tras «?»: con su %XX decodificado y el «+» como «+» (RFC 3986; no es un formulario), para
+     * que una fecha con zona escrita en la ruta (from_datetime=…+01:00) llegue tal cual.
      */
     private static function splitPath($path, $stripV3)
     {
@@ -310,7 +440,7 @@ class MundoSMS
             foreach (explode("&", substr($path, $p + 1)) as $pair) {
                 if ($pair === "") continue;
                 $kv = explode("=", $pair, 2);
-                $pathQuery[urldecode($kv[0])] = urldecode($kv[1] ?? "");
+                $pathQuery[rawurldecode($kv[0])] = rawurldecode($kv[1] ?? "");
             }
             $path = substr($path, 0, $p);
         }
@@ -362,6 +492,3 @@ class MundoSMS
     }
 }
 
-if (!function_exists("array_is_list")) {
-    function array_is_list(array $a) { return $a === array() || array_keys($a) === range(0, count($a) - 1); }
-}

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Pruebas del cliente C# (MundoSMS.cs), sin red y sin paquetes: un programa de consola con un servidor de prueba local.
+      dotnet run -c Release (desde esta carpeta; el código de salida es el número de fallos)
+    El fuente: dotnet/MundoSMS.cs del repositorio público, o MundoSMS.cs dos carpetas más arriba (con todos los clientes en una carpeta).
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>MundoSMS.Tests</AssemblyName>
+    <Nullable>disable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../MundoSMS.cs" Condition="Exists('../../MundoSMS.cs')" />
+    <Compile Include="../../dotnet/MundoSMS.cs" Condition="!Exists('../../MundoSMS.cs')" />
+    <Compile Include="Tests.cs" />
+  </ItemGroup>
+</Project>

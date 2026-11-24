@@ -1,0 +1,68 @@
+# Publica el cliente Node.js (node/, paquete @mundosms/sdk) en npm con Trusted Publishing (OIDC) y su procedencia (provenance):
+# sin tokens guardados, como PyPI, NuGet y RubyGems.
+# - Una etiqueta vX.Y.Z prueba, construye y comprueba; publica solo si la variable del repositorio NPM_OIDC vale 1 (se pone
+#   cuando el Trusted Publisher está dado de alta en npmjs.com; mientras no, el paquete se publica con el token, a mano).
+# - Lanzado a mano (workflow_dispatch) desde una rama, solo prueba, construye y comprueba: no publica.
+name: Publicar en npm
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.0"
+      - name: La etiqueta es la versión del paquete (y la del cliente)
+        run: |
+          v=$(node -p 'require("./paquetes/npm/package.json").version')
+          vc=$(sed -n 's/^const VERSION = "\([0-9.]*\)";.*/\1/p' node/mundosms.js)
+          if [ "$v" != "$vc" ]; then echo "package.json dice $v y node/mundosms.js, $vc"; exit 1; fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "v$v" != "$GITHUB_REF_NAME" ]; then echo "La etiqueta $GITHUB_REF_NAME no es la versión de package.json ($v)"; exit 1; fi
+      - name: Pruebas
+        run: node tests/node/test_mundosms.js
+      - name: Construir
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm" dist
+          cp paquetes/npm/package.json paquetes/npm/README.md node/mundosms.js node/mundosms.d.ts LICENSE "$RUNNER_TEMP/npm/"
+          (cd "$RUNNER_TEMP/npm" && npm pack --pack-destination "$GITHUB_WORKSPACE/dist")
+      - name: Comprobar
+        run: |
+          mkdir -p "$RUNNER_TEMP/prueba" && cd "$RUNNER_TEMP/prueba" && npm init -y > /dev/null
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE"/dist/*.tgz
+          node -e 'const m = require("@mundosms/sdk"); if (typeof m.MundoSMS !== "function") process.exit(1); console.log("@mundosms/sdk", m.VERSION)'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') && vars.NPM_OIDC == '1'
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@mundosms/sdk
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm
+          path: dist/
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.0"
+      - name: Publicar (OIDC, con procedencia)
+        run: npm publish dist/*.tgz --access public --provenance

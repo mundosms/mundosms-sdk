@@ -1,7 +1,7 @@
 # SDK de la API REST de MundoSMS
 
 Clientes de la [API REST v3 de MundoSMS](https://www.mundosms.es/api-v3) (centralita, llamadas, SMS, VozPush, NumCheck y
-WhatsApp) en **PHP, Python, Node.js, Java y C#**. Cada uno es **un solo fichero, sin dependencias**: lo copias en tu proyecto y ya.
+WhatsApp) en **PHP, Python, Node.js, Java, C#, Go y Ruby**. Cada uno es **un solo fichero, sin dependencias**: lo copias en tu proyecto y ya.
 Firman cada petición por ti (`X-Timestamp` en milisegundos y la firma HMAC de tu API Key), ponen una `Idempotency-Key` en
 cada `POST` para que un reintento no envíe nada dos veces, y reintentan solo lo que es seguro repetir. También comprueban la
 firma de los avisos que te mandamos ([Comprobar los avisos](#comprobar-los-avisos-que-te-llegan)).
@@ -9,14 +9,16 @@ firma de los avisos que te mandamos ([Comprobar los avisos](#comprobar-los-aviso
 | Lenguaje | Fichero | Requisitos |
 |---|---|---|
 | PHP | [`php/mundosms.php`](php/mundosms.php) | PHP 7.4 o superior, con la extensión curl |
-| Python | [`python/mundosms.py`](python/mundosms.py) | Python 3.8 o superior |
+| Python | [`python/mundosms.py`](python/mundosms.py) | Python 3.9 o superior |
 | Node.js | [`node/mundosms.js`](node/mundosms.js) (y [`node/mundosms.d.ts`](node/mundosms.d.ts), los tipos de TypeScript) | Node.js 18 o superior |
-| Java | [`java/MundoSMS.java`](java/MundoSMS.java) | Java 8 o superior |
+| Java | [`java/MundoSMS.java`](java/MundoSMS.java) (el paquete `es.mundosms:mundosms-sdk` de Maven Central) | Java 8 o superior |
 | C# (.NET) | [`dotnet/MundoSMS.cs`](dotnet/MundoSMS.cs) | .NET Framework 4.6.1 o superior, o .NET 5 o superior (C# 6 o superior) |
+| Go | [`go/mundosms.go`](go/mundosms.go) (el módulo `github.com/mundosms/mundosms-sdk/go`) | Go 1.22 o superior |
+| Ruby | [`ruby/lib/mundosms.rb`](ruby/lib/mundosms.rb) (la gema `mundosms`) | Ruby 3.1 o superior |
 
 Las API Keys (token y clave privada) se crean en el panel de MundoSMS, en **API y Soporte → Claves de API**.
 
-Los cinco tienen los mismos nombres, cada uno con el estilo de su lenguaje: `all()` recorre un listado entero,
+Todos tienen los mismos nombres, cada uno con el estilo de su lenguaje: `all()` recorre un listado entero,
 `lastCursor` guarda dónde se quedó, `request()` hace una petición cualquiera y `verifyWebhook()` comprueba un aviso.
 
 ## PHP
@@ -115,8 +117,19 @@ const recording = await api.get<FileResponse>("/calls/out/8812345/recording");  
 
 ## Java
 
-`MundoSMS.java` es un fichero del paquete `es.mundosms`. Cópialo en tu proyecto en la carpeta `es/mundosms/` de tus
-fuentes (con Maven o Gradle, `src/main/java/es/mundosms/MundoSMS.java`). Funciona desde Java 8.
+Está en Maven Central, `es.mundosms:mundosms-sdk`, sin dependencias. Funciona desde Java 8. Con Maven, en tu `pom.xml`:
+
+```xml
+<dependency>
+  <groupId>es.mundosms</groupId>
+  <artifactId>mundosms-sdk</artifactId>
+  <version>1.2.0</version>
+</dependency>
+```
+
+(con Gradle, `implementation("es.mundosms:mundosms-sdk:1.2.0")` en `dependencies`). También puedes copiar el fichero:
+`MundoSMS.java` es del paquete `es.mundosms` y va en la carpeta `es/mundosms/` de tus fuentes (con Maven o Gradle,
+`src/main/java/es/mundosms/MundoSMS.java`).
 
 ```java
 import es.mundosms.MundoSMS;
@@ -193,10 +206,127 @@ class Program
 - `All` se recorre con `foreach` y pide cada página cuando llegas a ella. En .NET 6 o superior también puedes usar
   `await foreach (var call in api.AllAsync("/calls", …))`.
 - Crea un cliente y reutilízalo: se puede usar desde varios hilos. Si usas `IHttpClientFactory`, pasa tu `HttpClient`
-  como tercer argumento.
+  como tercer argumento, con un manejador que **no siga redirecciones** (si las sigue, el constructor da
+  `ArgumentException`: una redirección llevaría tu firma y tus datos a otro servidor):
+
+  ```csharp
+  services.AddHttpClient("mundosms")
+          .ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler { AllowAutoRedirect = false })
+          .RedactLoggedHeaders(new[] { "Authorization", "X-Signature" });   // en .NET 6 y 7, que no salgan en los registros
+  var api = new MundoSMSClient("TU_TOKEN", "TU_CLAVE_PRIVADA", factory.CreateClient("mundosms"));
+  ```
+- Tus propias clases también valen para los datos: cada propiedad sale con el nombre de `[JsonPropertyName]`
+  (System.Text.Json), `[JsonProperty]` (Newtonsoft) o `[DataMember(Name)]` y, sin atributo, en snake_case (`ClientId` →
+  `client_id`). `[JsonIgnore]` no se manda y, con `[DataContract]`, solo van los `[DataMember]`. Un objeto anónimo va tal cual.
 - Las fechas van como texto (`"2026-11-01 08:00:00"`, hora de Madrid). Un `DateTime` da `ArgumentException` y no se
   manda nada.
 - En .NET Framework, si tu aplicación fijó `ServicePointManager.SecurityProtocol` sin TLS 1.2, el SDK lo añade.
+
+## Go
+
+Un módulo, `github.com/mundosms/mundosms-sdk/go`, con un solo fichero y sin dependencias (solo la biblioteca estándar).
+Funciona desde Go 1.22; recorrer `All` con `for … range` pide Go 1.23 o superior. En tu módulo:
+
+```sh
+go get github.com/mundosms/mundosms-sdk/go
+```
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+
+	mundosms "github.com/mundosms/mundosms-sdk/go"
+)
+
+func main() {
+	ctx := context.Background()
+	api, err := mundosms.New("TU_TOKEN", "TU_CLAVE_PRIVADA") // la clave privada, "" si tu API Key no exige firma
+	if err != nil {
+		log.Fatal(err)
+	}
+	r, err := api.Post(ctx, "/sms", mundosms.Params{"to": "34600123456", "text": "Tu cita es mañana a las 10:00", "from": "MiClinica"})
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(r.Data()["id"])
+
+	for call, err := range api.All(ctx, "/calls", mundosms.Params{"from_datetime": "2026-11-01"}) {
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(call["type"], call["id"], call["state"])
+	}
+
+	_, err = api.Patch(ctx, "/extensions/recepcion", mundosms.Params{"record_calls": true})
+	var e *mundosms.Error
+	if errors.As(err, &e) {
+		fmt.Println(e.HTTP, e.StatusCode, e.Message, e.Detail, e.RequestID)
+	}
+}
+```
+
+- **El contexto:** cada método lleva tu `context.Context` delante. Si lo cancelas (o vence su plazo), se corta la
+  petición, no se reintenta y no se espera más: el error es un `*mundosms.Error` con `HTTP` 0, y
+  `errors.Is(err, context.Canceled)` (o `context.DeadlineExceeded`) es `true`.
+- **Las respuestas** son el JSON entero, un `mundosms.Response` (un `map[string]any`): `r.Data()` es su `data`, los objetos
+  llegan como `map[string]any`, las listas como `[]any` y los números como `json.Number`, para no perder cifras
+  (`fmt.Println` los escribe tal cual; `n.Int64()` o `n.Float64()` si los quieres en un número). Con `r.Decode(&v)` pasas
+  la respuesta a tus propios tipos, como `json.Unmarshal`.
+- **Los datos** que mandas van en un `mundosms.Params` (un `map[string]any`) o, en `Post` y `Patch`, en tu struct con sus
+  etiquetas `json`. Un `map` no tiene orden: los filtros de la query van por orden alfabético (da igual: se firma justo lo
+  que se manda).
+- **`All`** es un iterador (`iter.Seq2[map[string]any, error]`): pide cada página cuando llegas a ella, y si sales del
+  bucle no pide más. Si una página falla, te da el error y no sigue. En Go 1.22, sin `range`, se llama con tu función:
+  `api.All(ctx, "/calls", q)(func(call map[string]any, err error) bool { …; return true })`.
+- **Lo que no se puede mandar** (una `Idempotency-Key` mal formada, un cuerpo que no se puede pasar a JSON, un filtro de
+  un tipo que no va en la query) da un error que envuelve a `mundosms.ErrInvalidArgument`, y no se manda nada.
+- Crea un cliente y reutilízalo: se puede usar desde varias goroutines a la vez.
+- `fmt.Print` del cliente (`%v`, `%+v`, `%#v`) enseña solo la dirección de la API: ni el token ni la clave privada.
+- La documentación del paquete está en [pkg.go.dev](https://pkg.go.dev/github.com/mundosms/mundosms-sdk/go).
+
+## Ruby
+
+Una gema, `mundosms`, con un solo fichero y sin dependencias (solo la biblioteca estándar). Ruby 3.1 o superior:
+
+```sh
+gem install mundosms
+```
+
+(o `gem "mundosms"` en tu `Gemfile`).
+
+```ruby
+require "mundosms"
+
+api = MundoSMS::Client.new("TU_TOKEN", "TU_CLAVE_PRIVADA")   # la clave privada, "" si tu API Key no exige firma
+r = api.post("/sms", { "to" => "34600123456", "text" => "Tu cita es mañana a las 10:00", "from" => "MiClinica" })
+puts r["data"]["id"]
+
+api.all("/calls", { "from_datetime" => "2026-11-01" }).each do |call|
+  puts "#{call['type']} #{call['id']} #{call['state']}"
+end
+
+begin
+  api.patch("/extensions/recepcion", { "record_calls" => true })
+rescue MundoSMS::Error => e
+  puts [e.http, e.status_code, e.message, e.detail, e.request_id].join(" ")
+end
+```
+
+- **Las respuestas** son el JSON entero, un `Hash` con claves de texto (`r["data"]["id"]`). Los datos que mandas pueden
+  llevar claves de texto o símbolos (`{ to: "…" }`).
+- **`all`** devuelve un `Enumerator::Lazy`: pide cada página cuando llegas a ella, así que `api.all("/calls").first(10)` pide
+  solo las que hacen falta. Con un bloque (`api.all("/calls") { |call| … }`) recorre el listado entero.
+- **Lo que no se puede mandar** (una `Idempotency-Key` mal formada, un texto que no es UTF-8, un `Hash` en la query) es un
+  `ArgumentError`, y no se manda nada. Una opción que no existe, también: `unknown keyword`.
+- Crea un cliente y reutilízalo: se puede usar desde varios hilos a la vez.
+- `p`, `inspect`, `to_s` y `pp` del cliente enseñan solo la dirección de la API: ni el token ni la clave privada.
+- **En Rails**, para comprobar los avisos que te llegan, usa `request.raw_post` y nunca `params`: [Comprobar los
+  avisos](#comprobar-los-avisos-que-te-llegan).
 
 ## Qué hace cada método
 
@@ -206,40 +336,64 @@ class Program
   - **La ruta** va sin `/v3` (`"/calls"`, `"/numbers/34910123456"`); si la escribes con `/v3` delante, se quita (cuando
     `baseUrl` ya lo lleva, como la de por defecto). Cada trozo se codifica solo (espacios, tildes, `+`…); un `%XX` que ya
     escribas se respeta. Si la ruta trae parámetros (`"/calls?type=in"`), se juntan con los del segundo argumento, y si se
-    repite uno, gana el del argumento.
+    repite uno, gana el del argumento. En esa query, un `%XX` se decodifica y un `+` es un `+`, no un espacio: una fecha con
+    zona escrita en la ruta (`"/calls?from_datetime=2026-11-20T10:15:03+01:00"`) llega tal cual.
   - **En `get` y `delete`**, los filtros van en la query: `true`/`false` como `true` y `false`, una lista separada por
     comas (`["in", "out"]` → `in,out`), y `null` (o `None`) y las listas vacías no se mandan.
   - **En `post` y `patch`**, los datos van en un cuerpo JSON.
 - `all(path, query)` recorre todas las páginas de un listado y te da los elementos uno a uno. Cada página lleva los
   mismos filtros (y el mismo `order`) más el `cursor` de la anterior. Al acabar, el último `next_cursor` queda en
-  `lastCursor` (PHP y Node.js), `last_cursor` (Python), `getLastCursor()` (Java) o `LastCursor` (C#). Guárdalo y pásalo
+  `lastCursor` (PHP y Node.js), `last_cursor` (Python y Ruby), `getLastCursor()` (Java), `LastCursor` (C#) o `LastCursor()` (Go). Guárdalo y pásalo
   como `cursor` la próxima vez para pedir solo lo nuevo.
-- **Ficheros:** las rutas que devuelven un audio o un PDF (la grabación de una llamada, una locución, el certificado de
-  un SMS) no contestan JSON. Vuelven como `{"status": "success", "content_type": "audio/mpeg", "body": …}`, con el
-  contenido tal cual en `body`: un `string` en PHP, `bytes` en Python, un `Buffer` en Node.js, un `byte[]` en Java y un
-  `byte[]` en C# (también en `r.Body`, con `r.ContentType`). Una respuesta vacía (un `204`) vuelve igual, con `body` vacío.
+  - Es el de ese recorrido: al empezarlo, el `cursor` que le pasas (o ninguno), y después el último `next_cursor` que llegó.
+    Una página que llega sin cursor no lo borra, y un recorrido que falla en la primera página no deja el de otro.
+  - Es uno por cliente: para dos recorridos a la vez (en dos hilos, o con `Promise.all`), un cliente para cada uno.
+  - Avanza cuando ya te ha dado todos los elementos de una página: si tu código falla a mitad de una, sigue en la
+    anterior. Guárdalo cuando el bucle termine sin error.
+  - Termina con `has_more: false`: con `stop_at_ongoing`, también cuando la página se para en una llamada en curso
+    (`data.ongoing_call`), y entonces `lastCursor` es justo antes de ella. También para si el cursor no avanza. Una página
+    **vacía con `has_more: true`** (con `stop_at_ongoing` y un filtro, cuando ha mirado muchas llamadas que no casan) no es
+    el final: sigue.
+  - `GET /calls/missed` y `GET /calls/live` no van por páginas: son una foto, y con `has_more: true` no traen `next_cursor`.
+    Ahí `all()` no puede darte la lista entera, así que da un error antes de ningún elemento: sube `limit` (hasta 500), o
+    filtra, y pídela con `get`.
+- `lastRateLimit` (`last_rate_limit` en Python y Ruby, `getLastRateLimit()` en Java, `LastRateLimit` en C# y
+  `LastRateLimit()` en Go) es el cupo que dijo la última respuesta, sus cabeceras `X-RateLimit-*`: `limit`, `remaining` y
+  `reset`, o nada si no las traía. Con él, un bucle tuyo no se pasa de las 10 peticiones por segundo: cuando `remaining`
+  llega a `0`, espera `reset` segundos.
+- **Ficheros:** las rutas que devuelven un audio, una imagen o un PDF (la grabación de una llamada, una locución, el
+  diagrama, el certificado de un SMS) no contestan JSON. Por su `Content-Type` (`audio/…`, `image/…`, `application/pdf`
+  o `application/octet-stream`), vuelven como `{"status": "success", "content_type": "audio/mpeg", "body": …}`, con el
+  contenido tal cual en `body`: un `string` en PHP, `bytes` en Python, un `Buffer` en Node.js, un `byte[]` en Java, un
+  `byte[]` en C# (también en `r.Body`, con `r.ContentType`) y un `[]byte` en Go (también `r.Body()`, con `r.ContentType()`).
+  Una respuesta vacía (un `204`) vuelve igual, con `body` vacío.
 
 ## Errores
 
-Cualquier respuesta con `"status": "error"` es una excepción `MundoSMSError` (en C#, `MundoSMSException`), venga con el
-código HTTP que venga. Un WhatsApp **sin confirmar** no es un error: la API contesta `202` con `"status": "success"` y
+Cualquier respuesta con `"status": "error"` es una excepción `MundoSMSError` (en C#, `MundoSMSException`; en Ruby,
+`MundoSMS::Error`; en Go, el error es un `*mundosms.Error`, que sacas con `errors.As`), venga con el código HTTP que venga. Un WhatsApp **sin confirmar** no es un error: la API contesta `202` con `"status": "success"` y
 `data.state` `"unknown"` (WhatsApp no contestó y el mensaje **puede haber salido**), y el SDK te devuelve la respuesta. No
 lo reenvíes.
 
-| | PHP | Python | Node.js | Java | C# |
-|---|---|---|---|---|---|
-| código HTTP (`0` si no hubo respuesta) | `$e->http` | `e.http` | `e.http` | `e.getHttp()` | `e.Http` |
-| `status_code` de la API (texto: `"3"`, `"4"`…) | `$e->statusCode` | `e.status_code` | `e.statusCode` | `e.getStatusCode()` | `e.StatusCode` |
-| mensaje | `$e->getMessage()` | `e.message` | `e.message` | `e.getMessage()` | `e.Message` |
-| `detail` | `$e->detail` | `e.detail` | `e.detail` | `e.getDetail()` | `e.Detail` |
-| `data` de la respuesta | `$e->data` | `e.data` | `e.data` | `e.getData()` | `e.Data` |
-| la cabecera `X-Request-Id` | `$e->requestId` | `e.request_id` | `e.requestId` | `e.getRequestId()` | `e.RequestId` |
-| la respuesta entera, decodificada | `$e->response` | `e.response` | `e.response` | `e.getResponse()` | `e.Response` |
+| | PHP | Python | Node.js | Java | C# | Go | Ruby |
+|---|---|---|---|---|---|---|---|
+| código HTTP (`0` si no hubo respuesta) | `$e->http` | `e.http` | `e.http` | `e.getHttp()` | `e.Http` | `e.HTTP` | `e.http` |
+| `status_code` de la API (texto: `"3"`, `"4"`…) | `$e->statusCode` | `e.status_code` | `e.statusCode` | `e.getStatusCode()` | `e.StatusCode` | `e.StatusCode` | `e.status_code` |
+| mensaje | `$e->getMessage()` | `e.message` | `e.message` | `e.getMessage()` | `e.Message` | `e.Message` | `e.message` |
+| `detail` | `$e->detail` | `e.detail` | `e.detail` | `e.getDetail()` | `e.Detail` | `e.Detail` | `e.detail` |
+| `data` de la respuesta | `$e->data` | `e.data` | `e.data` | `e.getData()` | `e.Data` | `e.Data` | `e.data` |
+| la cabecera `X-Request-Id` | `$e->requestId` | `e.request_id` | `e.requestId` | `e.getRequestId()` | `e.RequestId` | `e.RequestID` | `e.request_id` |
+| la respuesta entera, decodificada | `$e->response` | `e.response` | `e.response` | `e.getResponse()` | `e.Response` | `e.Response` | `e.response` |
 
 - Guarda el `X-Request-Id` cuando algo falle: con él encuentras la petición en Logs API y, si nos escribes, la
   encontramos nosotros.
 - Sin respuesta (la red, o el plazo agotado), `http` es `0` y el mensaje empieza por `No response from the API:`, seguido
   de la causa (`timed out after 60 s` si se agotó el plazo). Los mensajes del SDK van en inglés, como los de la API.
+- **Una redirección (`3xx`) no se sigue nunca:** la API no redirige, y seguirla llevaría tu token, tu firma, la
+  `Idempotency-Key` y, con un `307`, el cuerpo a otro servidor. Es un error con su `http` (`302`…) y adónde mandaba:
+  `HTTP 302: redirect to https://… not followed`. Si te pasa, revisa `baseUrl`.
+- **Un `2xx` que no es JSON** (el HTML de un proxy, de un portal cautivo o de un cortafuegos) también es un error, nunca un
+  éxito: `HTTP 200: the response is not JSON (text/html)`. Los ficheros de la API no, por su `Content-Type`.
 - En PHP, si los datos de un `post` o un `patch` no se pueden pasar a JSON (casi siempre, un texto que no es UTF-8), no se
   manda nada: salta una `InvalidArgumentException` que lo dice.
 - En Java, si los datos no se pueden pasar a JSON (un `NaN`, o un objeto que no es un `Map`, una lista, un array, un
@@ -264,13 +418,16 @@ Qué se reintenta, hasta `retries` veces (3 por defecto):
 | `5xx` | sí | no | no: la API no guarda los `5xx`, y repetirlo lo haría otra vez |
 
 Antes de cada intento se espera lo que diga la cabecera `Retry-After` (como mucho 60 segundos); si no la trae, 1, 2, 4…
-segundos. Cada intento va firmado con su propio `X-Timestamp`.
+segundos. Cada intento va firmado con su propio `X-Timestamp`, en milisegundos y siempre mayor que el de la petición
+anterior del mismo proceso: un reintento inmediato, o dos peticiones iguales a la vez, nunca firman igual (la API rechazaría
+la segunda por repetida).
 
 **Tu propia clave.** La clave automática protege los reintentos de una llamada. Si quieres que tampoco se repita cuando
 vuelves a llamar tú (tu programa se reinicia, tu cola reintenta un trabajo), pasa una clave tuya, estable para esa
 operación: por ejemplo, el id de tu pedido. De 1 a 64 caracteres: letras sin tilde, cifras y `_ . : -`. La API la recuerda
 24 horas. Con otra forma, el SDK lanza un error y **no manda nada**: `InvalidArgumentException` en PHP, `ValueError` en
-Python, `TypeError` en Node.js, `IllegalArgumentException` en Java y `ArgumentException` en C#.
+Python, `TypeError` en Node.js, `IllegalArgumentException` en Java, `ArgumentException` en C#, `ArgumentError` en Ruby y,
+en Go, un error que envuelve a `mundosms.ErrInvalidArgument`.
 
 ```php
 $r = $api->post("/whatsapp/messages", ["to" => "34600000001", "type" => "text", "text" => "Tu pedido ha salido"],
@@ -297,17 +454,33 @@ var r = await api.PostAsync("/whatsapp/messages", new { to = "34600000001", type
                             new MundoSMSRequestOptions { IdempotencyKey = "pedido-881" });
 ```
 
-En `request` (y en C#, `RequestAsync` y `Request`), las opciones van en el cuarto argumento.
+```go
+r, err := api.Post(ctx, "/whatsapp/messages", mundosms.Params{"to": "34600000001", "type": "text", "text": "Tu pedido ha salido"},
+	mundosms.IdempotencyKey("pedido-881"))
+```
+
+```ruby
+r = api.post("/whatsapp/messages", { "to" => "34600000001", "type" => "text", "text" => "Tu pedido ha salido" },
+             idempotency_key: "pedido-881")
+```
+
+En `request` (y en C#, `RequestAsync` y `Request`), las opciones van en el cuarto argumento; en Go, detrás de los datos,
+también en `Request`.
 
 **La respuesta repetida.** Cuando la API devuelve la respuesta guardada de la primera vez (con la cabecera
 `Idempotent-Replayed: true`), la respuesta trae además **`"idempotent_replayed": true`**; en C#, también
-`r.IdempotentReplayed`. Quiere decir que no se ha vuelto a hacer nada: el `id` es el de la primera vez. Si no se repitió,
+`r.IdempotentReplayed`, y en Go, `r.IdempotentReplayed()`. Quiere decir que no se ha vuelto a hacer nada: el `id` es el de la primera vez. Si no se repitió,
 ese campo no va.
 
 - La misma clave con otra petición (otra ruta u otro cuerpo) da `422 Idempotency-Key already used`: es un error, no se
   reintenta.
 - En `POST /v3/extensions` la API no guarda la respuesta, porque lleva la contraseña SIP. Si un reintento da
   `409 Extension already exists`, la creó el intento anterior: su contraseña está en el panel, en **Líneas SIP**.
+- **Un `DELETE` que se quedó sin respuesta** se repite, y si la API contesta entonces `404`, es que el intento que se quedó
+  sin respuesta ya lo borró: vuelve como éxito, `{"status": "success", "message": "Already deleted", "data": {"state":
+  "deleted", "changed": false}}`, y no como error. Sin el fallo de red de antes, un `404` sigue siendo un error. Lo mismo si
+  la petición la repitió el propio cliente HTTP con la misma firma, con «Rechazar peticiones repetidas» en la clave (así
+  nacen): la API contesta `409 Duplicated request` y el SDK la repite firmada de nuevo.
 
 ## Opciones
 
@@ -315,12 +488,14 @@ En el tercer argumento del constructor:
 
 | Opción | Qué es | Por defecto |
 |---|---|---|
-| `baseUrl` (Python: `base_url`) | la dirección de la API | `https://api.mundosms.es/v3` |
+| `baseUrl` (Python y Ruby: `base_url`) | la dirección de la API | `https://api.mundosms.es/v3` |
 | `retries` | cuántas veces se reintenta lo que es seguro repetir (`0`, ninguna) | `3` |
 | `timeout` | los segundos que puede durar cada petición entera (conectar, mandar y recibir la respuesta). Admite decimales | `60` |
 
 Una opción que no existe (por ejemplo, mal escrita) da error al crear el cliente, en vez de ignorarse:
-`InvalidArgumentException` en PHP y `TypeError` en Python y Node.js.
+`InvalidArgumentException` en PHP, `TypeError` en Python y Node.js y `ArgumentError` en Ruby. Un valor que no vale (unos
+`retries` negativos, un `timeout` de 0, una dirección que no es `http(s)://`), también: `InvalidArgumentException` en PHP,
+`ValueError` en Python, `TypeError` en Node.js y `ArgumentError` en Ruby.
 
 ```php
 $api = new MundoSMS("TU_TOKEN", "TU_CLAVE_PRIVADA", ["retries" => 5, "timeout" => 90]);
@@ -334,8 +509,14 @@ api = MundoSMS("TU_TOKEN", "TU_CLAVE_PRIVADA", retries=5, timeout=90)
 const api = new MundoSMS("TU_TOKEN", "TU_CLAVE_PRIVADA", { retries: 5, timeout: 90 });
 ```
 
+```ruby
+api = MundoSMS::Client.new("TU_TOKEN", "TU_CLAVE_PRIVADA", retries: 5, timeout: 90)   # y base_url:
+```
+
 En Java, las opciones van en un `MundoSMS.Options`; en C#, son propiedades (`BaseUrl`, `Retries` y `Timeout`, un
-`TimeSpan`):
+`TimeSpan`); en Go, van detrás de la clave privada (`mundosms.BaseURL`, `mundosms.Retries` y `mundosms.Timeout`, un
+`time.Duration`), y un valor que no vale (unos `retries` negativos, una dirección que no es `http(s)://`) hace que `New`
+devuelva un error:
 
 ```java
 MundoSMS api = new MundoSMS("TU_TOKEN", "TU_CLAVE_PRIVADA", new MundoSMS.Options().retries(5).timeout(90));
@@ -345,6 +526,14 @@ MundoSMS api = new MundoSMS("TU_TOKEN", "TU_CLAVE_PRIVADA", new MundoSMS.Options
 var api = new MundoSMSClient("TU_TOKEN", "TU_CLAVE_PRIVADA") { Retries = 5, Timeout = TimeSpan.FromSeconds(90) };
 ```
 
+```go
+api, err := mundosms.New("TU_TOKEN", "TU_CLAVE_PRIVADA", mundosms.Retries(5), mundosms.Timeout(90*time.Second))
+```
+
+En Go hay una opción más, `mundosms.HTTPClient(…)`, para que use tu `*http.Client` (un proxy, tu propio `Transport`); sus
+redirecciones no se siguen igualmente. En C#, el tercer argumento del constructor es tu `HttpClient`, sin redirecciones
+([C#](#c-net)).
+
 ## Comprobar los avisos que te llegan
 
 Los avisos que te mandamos a tu URL (los de `callback_url` en SMS, VozPush y NumCheck, y los webhooks de WhatsApp) llevan
@@ -353,8 +542,10 @@ tocado. El secreto está en el panel, en **API y Soporte → Webhooks** (`whsec_
 el destino del número.
 
 Cada SDK lo comprueba con una función: `MundoSMS::verifyWebhook` (PHP), `MundoSMS.verify_webhook` (Python),
-`MundoSMS.verifyWebhook` (Node.js y Java) y `MundoSMSClient.VerifyWebhook` (C#). Los argumentos son el secreto, la
-cabecera, el cuerpo y, opcional, la tolerancia en segundos (300). Devuelve `true` si:
+`MundoSMS.verifyWebhook` (Node.js y Java), `MundoSMSClient.VerifyWebhook` (C#), `mundosms.VerifyWebhook` (Go) y
+`MundoSMS.verify_webhook` (Ruby). Los argumentos son el secreto, la cabecera, el cuerpo y, opcional, la tolerancia en
+segundos (300; en Ruby, `tolerance:`; en Go, con otra tolerancia, `mundosms.VerifyWebhookWithTolerance`, un
+`time.Duration`). Devuelve `true` si:
 
 - `v1` es el HMAC-SHA256, en hexadecimal, de `t` + `.` + el cuerpo, con tu secreto (comparado en tiempo constante);
 - y `t` no se aleja de tu hora más de la tolerancia: 5 minutos, salvo que digas otra cosa.
@@ -469,13 +660,77 @@ app.MapPost("/", async (HttpRequest req) =>
 app.Run("http://0.0.0.0:8080");
 ```
 
+Go, con `net/http`:
+
+```go
+package main
+
+import (
+	"io"
+	"log"
+	"net/http"
+
+	mundosms "github.com/mundosms/mundosms-sdk/go"
+)
+
+func main() {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20)) // tal cual llega
+		if err != nil || !mundosms.VerifyWebhook("whsec_...", r.Header.Get("X-MundoSMS-Signature"), body) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		// guarda el aviso (json.Unmarshal(body, …)) y procésalo después
+		w.WriteHeader(http.StatusNoContent)
+	})
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+```
+
+Ruby, en un controlador de Rails (el cuerpo tal cual es `request.raw_post`, nunca `params`, que es el JSON ya leído y
+vuelto a montar; con `ActionController::Base`, añade `skip_forgery_protection`):
+
+```ruby
+class AvisosController < ActionController::API
+  def create
+    cuerpo = request.raw_post   # tal cual llega
+    return head(:unauthorized) unless MundoSMS.verify_webhook("whsec_...", request.headers["X-MundoSMS-Signature"].to_s, cuerpo)
+
+    AvisoJob.perform_later(cuerpo)   # guarda el aviso y procésalo después
+    head :no_content
+  end
+end
+```
+
 La referencia completa de cada ruta, sus parámetros y sus respuestas está en
 **[www.mundosms.es/api-v3](https://www.mundosms.es/api-v3)**.
 
 ## Versiones
 
-Cada versión lleva su etiqueta (`v1.0.0`…) y sus cambios en [CHANGELOG.md](CHANGELOG.md). Para no llevarte cambios sin
-querer, descarga el fichero de una versión concreta.
+Cada versión lleva su etiqueta (`v1.2.0`…) y sus cambios en [CHANGELOG.md](CHANGELOG.md). Para no llevarte cambios sin
+querer, descarga el fichero de una versión concreta. El módulo de Go lleva además su etiqueta, `go/v1.2.0`…, con la misma
+versión: `go get github.com/mundosms/mundosms-sdk/go@v1.2.0`.
+
+Con Composer (`composer require mundosms/sdk`) solo se instala lo de PHP (`php/`, `composer.json`, este README, la licencia
+y los cambios). El zip del código de cada versión en GitHub («Source code») también lleva solo eso; con todos los clientes,
+descarga el `mundosms-sdk-X.Y.Z.zip` adjunto a cada versión, desde la 1.1.0.
+
+## Pruebas
+
+Cada cliente lleva sus pruebas, sin red: un servidor de prueba local que comprueba la firma como la API (los ejemplos de
+«Para comprobar tu código» y el del aviso de `whsec_ejemplo`), los reintentos, el plazo, la paginación, las redirecciones, un
+`2xx` que no es JSON y el `DELETE` repetido. Se pasan en cada PR, con la versión más vieja que promete cada uno y con la de
+hoy (`.github/workflows/ci.yml`):
+
+```sh
+php tests/php/test_mundosms.php
+python3 tests/python/test_mundosms.py
+node tests/node/test_mundosms.js
+javac -encoding UTF-8 -d /tmp/c java/MundoSMS.java tests/java/MundoSMSTest.java && java -cp /tmp/c MundoSMSTest
+dotnet run -c Release --project tests/dotnet/MundoSMS.Tests.csproj
+cd go && go test ./...
+cd ruby && ruby -w -Ilib test/test_mundosms.rb
+```
 
 ## Licencia
 

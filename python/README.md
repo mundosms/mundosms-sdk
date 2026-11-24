@@ -1,15 +1,17 @@
-# mundosms
+# mundosms-sdk
 
 Cliente Python de la [API REST v3 de MundoSMS](https://www.mundosms.es/api-v3): centralita, llamadas, SMS, VozPush,
 NumCheck y WhatsApp. Firma cada petición por ti (`X-Timestamp` en milisegundos y la firma HMAC de tu API Key), pone una
 `Idempotency-Key` en cada `POST` para que un reintento no envíe nada dos veces, y reintenta solo lo que es seguro repetir.
 Comprueba también la firma de los avisos que te mandamos. Sin dependencias: solo la biblioteca estándar.
 
-Requiere Python 3.8 o superior.
+Requiere Python 3.9 o superior.
 
 ```sh
 pip install mundosms-sdk
 ```
+
+Se importa como `mundosms`.
 
 Las API Keys (token y clave privada) se crean en el panel de MundoSMS, en **API y Soporte → Claves de API**.
 
@@ -46,12 +48,16 @@ except MundoSMSError as e:
   devuelve la respuesta guardada de la primera vez, trae `"idempotent_replayed": True`.
 - `MundoSMS.verify_webhook(secret, header, body)` comprueba la cabecera `X-MundoSMS-Signature` de un aviso que te llega
   (de `callback_url` o un webhook de WhatsApp), con el cuerpo tal cual llegó (`bytes`): `True` o `False`.
-- Opciones, con nombre: `MundoSMS(token, private_key, base_url=…, retries=3, timeout=60)`.
+- Opciones, con nombre: `MundoSMS(token, private_key, base_url=…, retries=3, timeout=60)`. Un valor que no vale es un
+  `ValueError`.
+- Una redirección no se sigue nunca (llevaría tu token y tu firma a otro servidor): es un `MundoSMSError`. Un 2xx que no es
+  JSON (el HTML de un proxy), también.
+- `api.last_rate_limit` es el cupo de la última respuesta (`X-RateLimit-*`): `{"limit": 10, "remaining": 7, "reset": 1}`.
 
 ## Documentación
 
 La referencia completa de cada ruta, sus parámetros y sus respuestas: **[www.mundosms.es/api-v3](https://www.mundosms.es/api-v3)**.
-El código, los clientes en PHP, Node.js, Java y C# y los cambios de cada versión:
+El código, los clientes en PHP, Node.js, Java, C#, Go y Ruby y los cambios de cada versión:
 [github.com/mundosms/mundosms-sdk](https://github.com/mundosms/mundosms-sdk).
 
 ## Licencia

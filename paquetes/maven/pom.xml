@@ -1,0 +1,415 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  El SDK de Java de la API REST v3 de MundoSMS como paquete de Maven (es.mundosms:mundosms-sdk).
+
+  El código es UN fichero, MundoSMS.java, que no vive con la estructura de carpetas de Maven (propiedad fuente.dir, o
+  -Dfuente.dir=…): dos carpetas más arriba (docs/apiv3/sdk/), en ../../java/ (el repositorio público) o en la misma carpeta
+  que este pom. Antes de compilar se copia a target/fuente/es/mundosms/, y de ahí salen el jar, el de fuentes y el de
+  Javadoc, con su ruta de paquete. Si no lo encuentra, se para (no saca un jar vacío), y tampoco sigue si el jar se queda
+  sin la LICENSE (META-INF/LICENSE).
+
+    mvn package                    los tres jar en target/ (el código se compila para Java 8)
+    mvn -P publicar deploy         firma con GPG (.asc de los tres jar y del pom), sube a Maven Central y lo publica
+                                   (autoPublish), y espera hasta verlo publicado (waitUntil=published, hasta 1 hora).
+                                   Lo hace el workflow publish-maven.yml con cada etiqueta vX.Y.Z: el servidor «central»
+                                   (el token del portal) va en un settings.xml que lee las variables de entorno, y la
+                                   frase de la clave GPG, en MAVEN_GPG_PASSPHRASE (gpg en modo loopback, sin preguntar).
+    mvn -P publicar -Dcentral.skipUpload=true deploy
+                                   lo mismo sin subir nada: deja el paquete que se subiría en
+                                   target/central-publishing/central-bundle.zip
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>es.mundosms</groupId>
+  <artifactId>mundosms-sdk</artifactId>
+  <version>1.2.0</version>
+  <packaging>jar</packaging>
+
+  <name>MundoSMS SDK</name>
+  <description>Cliente Java de la API REST v3 de MundoSMS (centralita, llamadas, SMS, VozPush, NumCheck y WhatsApp): un solo fichero, sin dependencias, para Java 8 o superior. Firma cada petición y reintenta solo lo que es seguro repetir.</description>
+  <url>https://github.com/mundosms/mundosms-sdk</url>
+  <inceptionYear>2026</inceptionYear>
+
+  <organization>
+    <name>MundoSMS</name>
+    <url>https://www.mundosms.es</url>
+  </organization>
+
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://opensource.org/licenses/MIT</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <id>mundosms</id>
+      <name>MundoSMS</name>
+      <email>contacto@mundosms.es</email>
+      <url>https://www.mundosms.es</url>
+      <organization>MundoSMS</organization>
+      <organizationUrl>https://www.mundosms.es</organizationUrl>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/mundosms/mundosms-sdk.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/mundosms/mundosms-sdk.git</developerConnection>
+    <url>https://github.com/mundosms/mundosms-sdk</url>
+    <tag>v${project.version}</tag>
+  </scm>
+
+  <issueManagement>
+    <system>GitHub</system>
+    <url>https://github.com/mundosms/mundosms-sdk/issues</url>
+  </issueManagement>
+
+  <properties>
+    <!-- la carpeta que tiene MundoSMS.java; se puede cambiar con -Dfuente.dir=… -->
+    <fuente.dir>${project.basedir}/../..</fuente.dir>
+    <!-- la carpeta que tiene la LICENSE, que va dentro del jar (META-INF/LICENSE): dos más arriba, aquí y en el repositorio público -->
+    <licencia.dir>${project.basedir}/../..</licencia.dir>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <!-- compilaciones reproducibles: la misma fecha en todos los ficheros de los jar -->
+    <project.build.outputTimestamp>2026-11-24T00:00:00Z</project.build.outputTimestamp>
+    <!-- -Dcentral.skipUpload=true: el perfil publicar arma y firma el paquete de Maven Central, pero no lo sube -->
+    <central.skipUpload>false</central.skipUpload>
+  </properties>
+
+  <build>
+    <sourceDirectory>${project.build.directory}/fuente</sourceDirectory>
+    <!-- la licencia, dentro del jar: META-INF/LICENSE -->
+    <resources>
+      <resource>
+        <directory>${licencia.dir}</directory>
+        <includes>
+          <include>LICENSE</include>
+        </includes>
+        <targetPath>META-INF</targetPath>
+      </resource>
+    </resources>
+
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-clean-plugin</artifactId>
+          <version>3.5.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-enforcer-plugin</artifactId>
+          <version>3.6.2</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-resources-plugin</artifactId>
+          <version>3.4.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.15.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.5.5</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-jar-plugin</artifactId>
+          <version>3.5.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-source-plugin</artifactId>
+          <version>3.4.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-javadoc-plugin</artifactId>
+          <version>3.12.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-install-plugin</artifactId>
+          <version>3.1.4</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-deploy-plugin</artifactId>
+          <version>3.1.4</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-gpg-plugin</artifactId>
+          <version>3.2.8</version>
+        </plugin>
+        <plugin>
+          <groupId>org.sonatype.central</groupId>
+          <artifactId>central-publishing-maven-plugin</artifactId>
+          <version>0.12.0</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+
+    <plugins>
+      <!-- MundoSMS.java, a su ruta de paquete (es/mundosms/) dentro de target/fuente -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-resources-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>copia-fuente</id>
+            <phase>generate-sources</phase>
+            <goals>
+              <goal>copy-resources</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/fuente/es/mundosms</outputDirectory>
+              <resources>
+                <resource>
+                  <directory>${fuente.dir}</directory>
+                  <includes>
+                    <include>MundoSMS.java</include>
+                  </includes>
+                  <filtering>false</filtering>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- sin MundoSMS.java no se sigue (si no, saldría un jar vacío). Se mira la copia: la regla no acepta rutas con «..» -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-enforcer-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>hay-fuente</id>
+            <phase>process-sources</phase>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <requireFilesExist>
+                  <files>
+                    <file>${project.build.directory}/fuente/es/mundosms/MundoSMS.java</file>
+                  </files>
+                  <message>No está MundoSMS.java en ${fuente.dir}: pásalo con -Dfuente.dir=…</message>
+                </requireFilesExist>
+              </rules>
+            </configuration>
+          </execution>
+          <!-- Maven Central no deja corregir una versión: sin la LICENSE dentro del jar, no se empaqueta -->
+          <execution>
+            <id>hay-licencia</id>
+            <phase>prepare-package</phase>
+            <goals>
+              <goal>enforce</goal>
+            </goals>
+            <configuration>
+              <rules>
+                <requireFilesExist>
+                  <files>
+                    <file>${project.build.outputDirectory}/META-INF/LICENSE</file>
+                  </files>
+                  <message>No está la LICENSE en ${licencia.dir}: el jar saldría sin META-INF/LICENSE</message>
+                </requireFilesExist>
+              </rules>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <compilerArgs>
+            <arg>-Xlint:all,-options</arg>
+          </compilerArgs>
+          <showWarnings>true</showWarnings>
+          <failOnWarning>true</failOnWarning>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <configuration>
+          <archive>
+            <manifestEntries>
+              <Automatic-Module-Name>es.mundosms</Automatic-Module-Name>
+              <Implementation-Title>${project.name}</Implementation-Title>
+              <Implementation-Version>${project.version}</Implementation-Version>
+              <Implementation-Vendor>MundoSMS</Implementation-Vendor>
+            </manifestEntries>
+          </archive>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-source-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>fuentes</id>
+            <goals>
+              <goal>jar-no-fork</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-javadoc-plugin</artifactId>
+        <configuration>
+          <doclint>all</doclint>
+          <detectJavaApiLink>false</detectJavaApiLink>
+          <docencoding>UTF-8</docencoding>
+          <charset>UTF-8</charset>
+        </configuration>
+        <executions>
+          <execution>
+            <id>javadoc</id>
+            <goals>
+              <goal>jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+
+  <profiles>
+    <!-- en el repositorio público (paquetes/maven/pom.xml y java/MundoSMS.java), el código se toma de java/ -->
+    <profile>
+      <id>fuente-repo-publico</id>
+      <activation>
+        <file>
+          <exists>${basedir}/../../java/MundoSMS.java</exists>
+        </file>
+      </activation>
+      <properties>
+        <fuente.dir>${project.basedir}/../../java</fuente.dir>
+      </properties>
+    </profile>
+
+    <!-- si el pom está en la misma carpeta que MundoSMS.java, el código se toma de ahí -->
+    <profile>
+      <id>fuente-al-lado</id>
+      <activation>
+        <file>
+          <exists>${basedir}/MundoSMS.java</exists>
+        </file>
+      </activation>
+      <properties>
+        <fuente.dir>${project.basedir}</fuente.dir>
+        <licencia.dir>${project.basedir}</licencia.dir>
+      </properties>
+    </profile>
+
+    <!-- el código se compila para Java 8 con cualquier JDK: con el 8, source/target; con el 9 o posterior, release -->
+    <profile>
+      <id>jdk8</id>
+      <activation>
+        <jdk>1.8</jdk>
+      </activation>
+      <properties>
+        <maven.compiler.source>1.8</maven.compiler.source>
+        <maven.compiler.target>1.8</maven.compiler.target>
+      </properties>
+    </profile>
+    <profile>
+      <id>jdk9-o-posterior</id>
+      <activation>
+        <jdk>[9,)</jdk>
+      </activation>
+      <properties>
+        <maven.compiler.release>8</maven.compiler.release>
+      </properties>
+    </profile>
+
+    <!-- mvn -P publicar deploy: firma, sube a Maven Central, lo publica y espera a verlo publicado (lo hace el workflow
+         publish-maven.yml con la etiqueta vX.Y.Z). Central no admite repetir ni borrar una versión. -->
+    <profile>
+      <id>publicar</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-enforcer-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>version-publicable</id>
+                <phase>validate</phase>
+                <goals>
+                  <goal>enforce</goal>
+                </goals>
+                <configuration>
+                  <rules>
+                    <requireReleaseVersion>
+                      <message>Maven Central no publica versiones -SNAPSHOT por aquí</message>
+                    </requireReleaseVersion>
+                  </rules>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <!-- .asc de cada fichero (pom y los tres jar). La frase, de la variable de entorno MAVEN_GPG_PASSPHRASE (el plugin
+               se la pasa a gpg por la entrada estándar); loopback para que gpg no pida la frase a un pinentry, que en el
+               workflow no existe. Sin la variable, el plugin pone detrás «pinentry-mode error» y falla, no se queda
+               esperando. bestPractices: falla si la frase viniera del pom o del settings.xml. -->
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <executions>
+              <execution>
+                <id>firma</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <bestPractices>true</bestPractices>
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <!-- la subida al Central Portal. autoPublish (publishingType AUTOMATIC): si pasa la validación, se publica sin
+               pasar por la web, como una etiqueta publica en PyPI, NuGet y RubyGems. waitUntil=published: el job espera a
+               que Central diga PUBLISHED, y falla si la validación falla o si no llega en waitMaxTime (1 hora; el mínimo
+               que admite son 1800 s). checksums all: .md5 y .sha1 (los que pide Central) y .sha256 y .sha512. -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+              <waitUntil>published</waitUntil>
+              <waitMaxTime>3600</waitMaxTime>
+              <checksums>all</checksums>
+              <deploymentName>${project.artifactId} ${project.version}</deploymentName>
+              <skipUpload>${central.skipUpload}</skipUpload>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

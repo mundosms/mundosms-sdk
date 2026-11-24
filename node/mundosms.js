@@ -19,16 +19,24 @@
  * idempotent_replayed: true.
  * Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
  * con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como mucho
- * 60 s) o, si no lo trae, 1, 2, 4… s.
+ * 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
+ * como éxito, con data.changed false.
+ * Una redirección (3xx) no se sigue nunca: es un MundoSMSError (la API no redirige, y seguirla llevaría tu firma y tus datos
+ * a otro servidor). Un 2xx que no es JSON (el HTML de un proxy o de un portal cautivo) también es un error; los ficheros que
+ * da la API (audio, imagen, PDF) vuelven por su Content-Type.
  * Los avisos que te mandamos (callback_url y webhooks de WhatsApp) se comprueban con MundoSMS.verifyWebhook().
  */
 "use strict";
 const crypto = require("crypto");
 
-const VERSION = "1.0.0";
+const VERSION = "1.2.0";
 const MAX_RETRY_WAIT = 60; // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
 const WEBHOOK_TOLERANCE = 300; // segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
 const CLIENT_OPTIONS = ["baseUrl", "retries", "timeout"];
+const FILE_TYPES = /^(audio\/|image\/|application\/pdf$|application\/octet-stream$)/; // lo que la API da como fichero
+const NOT_PAGINATED = "MundoSMS: all() cannot go through %s: it has more (has_more) but no next_cursor, so the list is not paginated: " +
+  "raise limit or narrow the filters, and read it with get()";
+let lastTimestamp = 0; // el X-Timestamp de la última petición de este proceso (milisegundos)
 
 class MundoSMSError extends Error {
   constructor(message, http = 0, statusCode = null, detail = null, response = null, data = null, requestId = null) {
@@ -50,7 +58,8 @@ class MundoSMS {
   /**
    * token: el Token de tu API Key (empieza por eyJ); privateKey: su clave privada si exige firma (lo normal), o "".
    * options: baseUrl (https://api.mundosms.es/v3), retries (3) y timeout: los segundos que puede durar cada petición entera
-   * (conectar, mandar y recibir la respuesta), 60. El token y la clave no quedan a la vista en el objeto (ni en un console.log).
+   * (conectar, mandar y recibir la respuesta), 60. Un valor que no vale es un TypeError. El token y la clave no quedan a la vista
+   * en el objeto (ni en un console.log).
    */
   constructor(token, privateKey = "", options = {}) {
     if (options === null || options === undefined) options = {};
@@ -59,12 +68,22 @@ class MundoSMS {
       if (!CLIENT_OPTIONS.includes(k)) throw new TypeError('MundoSMS: unknown option "' + k + '" (options: baseUrl, retries, timeout)');
     }
     const { baseUrl = "https://api.mundosms.es/v3", retries = 3, timeout = 60 } = options;
+    let u = null;
+    try { u = new URL(String(baseUrl).replace(/\/+$/, "")); } catch (e) { u = null; }
+    if (!u || (u.protocol !== "https:" && u.protocol !== "http:") || u.search || u.hash) {
+      throw new TypeError("MundoSMS: baseUrl must be an http(s) address without query, like https://api.mundosms.es/v3");
+    }
+    if (!Number.isInteger(retries) || retries < 0) throw new TypeError("MundoSMS: retries must be an integer, 0 or more");
+    if (typeof timeout !== "number" || !(timeout > 0) || !Number.isFinite(timeout)) {
+      throw new TypeError("MundoSMS: timeout must be a number of seconds greater than 0");
+    }
     this.#token = String(token).trim();
     this.#privateKey = String(privateKey || "").trim();
     this.baseUrl = String(baseUrl).replace(/\/+$/, "");
     this.retries = retries;
     this.timeout = timeout;
-    this.lastCursor = null; // el de all(): guárdalo para la siguiente sincronización
+    this.lastCursor = null; // el del último all(): guárdalo para la siguiente sincronización
+    this.lastRateLimit = null; // el cupo que dijo la última respuesta: { limit, remaining, reset }, o null
   }
 
   /** GET: query va en la query. */
@@ -81,19 +100,33 @@ class MundoSMS {
 
   /**
    * Recorre un listado entero, página a página, siguiendo su cursor (next_cursor), elemento a elemento. Cada página lleva los
-   * mismos filtros (y el mismo order) más el cursor. Para sincronizar, guarda tú lastCursor: la siguiente vez empiezas desde
-   * ahí, pasándolo como cursor.
+   * mismos filtros (y el mismo order) más el cursor. Para sincronizar, guarda tú lastCursor al acabar: la siguiente vez
+   * empiezas desde ahí, pasándolo como cursor. lastCursor es el de este recorrido: al empezar, el cursor que le pasas (o null),
+   * y después el último next_cursor que llegó (una página sin cursor no lo borra). Es uno por cliente: para dos recorridos a
+   * la vez, un cliente para cada uno. lastCursor avanza cuando ya te ha dado todos los elementos de una página: si tu código
+   * falla a mitad de una, sigue en la anterior.
+   * Termina con has_more false (con stop_at_ongoing, también cuando la página se para en una llamada en curso), o si el cursor
+   * no avanza. Una página vacía con has_more true (con stop_at_ongoing y un filtro, cuando ha mirado muchas que no casan) no es
+   * el final: sigue.
+   * Una lista que no va por páginas (GET /calls/missed y /calls/live: has_more sin next_cursor) no se puede recorrer entera: es
+   * un MundoSMSError, antes de dar nada. Sube limit, o filtra, y pídela con get().
    */
   async *all(path, query = {}) {
     query = { ...query };
+    this.lastCursor = query.cursor === undefined || query.cursor === null || query.cursor === "" ? null : query.cursor;
     let listKey = null;
     for (;;) {
-      const data = (await this.get(path, query)).data || {};
+      const r = await this.get(path, query);
+      const data = r.data && typeof r.data === "object" && !Array.isArray(r.data) ? r.data : {};
+      const cursor = data.next_cursor;
+      if (data.has_more && data.results && !cursor) {
+        throw new MundoSMSError(NOT_PAGINATED.replace("%s", path), 200, r.status_code ?? null, null, r, data, null);
+      }
       if (listKey === null) listKey = Object.keys(data).find((k) => Array.isArray(data[k])) || null;
       for (const item of listKey ? data[listKey] || [] : []) yield item;
-      this.lastCursor = data.next_cursor ?? null;
-      if (!data.has_more || !data.results || !data.next_cursor) return;
-      query.cursor = data.next_cursor;
+      if (cursor) this.lastCursor = cursor;
+      if (!data.has_more || !cursor || cursor === query.cursor || data.ongoing_call) return;
+      query.cursor = cursor;
     }
   }
 
@@ -117,8 +150,9 @@ class MundoSMS {
       .map(([k, t]) => rfc3986(k) + "=" + rfc3986(t)).join("&");
     const url = this.baseUrl + encodedPath + (query ? "?" + query : "");
     const signedPath = new URL(url).pathname + (query ? "?" + query : ""); // lo que se firma es justo lo que se manda
+    let afterNetwork = false; // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
     for (let attempt = 1; ; attempt++) {
-      const ts = String(Date.now()); // milisegundos: dos peticiones iguales seguidas no firman igual
+      const ts = timestamp(); // dos peticiones iguales a la vez, o un reintento inmediato, no firman igual
       const headers = { Authorization: "Bearer " + this.#token, "X-Timestamp": ts, Accept: "application/json", "User-Agent": "MundoSMS-Node/" + VERSION };
       if (body) headers["Content-Type"] = "application/json";
       if (idemKey) headers["Idempotency-Key"] = idemKey; // la misma en todos los intentos de esta llamada
@@ -126,9 +160,11 @@ class MundoSMS {
         headers["X-Signature"] = crypto.createHmac("sha256", this.#privateKey)
           .update(this.#token + "." + ts + "." + method + " " + signedPath + "." + body).digest("base64url");
       }
-      let http = 0, contentType = "", resp = null, networkError = "", r = null;
+      let http = 0, contentType = "", resp = null, networkError = "", cause = null, r = null;
       try {
-        r = await fetch(url, { method, headers, body: body || undefined,
+        // redirect "manual": la redirección no se sigue (fetch la sigue por defecto, y llevaría la firma, la Idempotency-Key y,
+        // con un 307, el cuerpo a otro servidor); el 3xx llega como respuesta y es un error
+        r = await fetch(url, { method, headers, body: body || undefined, redirect: "manual",
                                signal: AbortSignal.timeout(Math.max(1, Math.round(this.timeout * 1000))) });
         http = r.status;
         contentType = r.headers.get("content-type") || "";
@@ -136,28 +172,47 @@ class MundoSMS {
       } catch (e) {
         http = 0; // se cortó a medias: es un fallo de red aunque llegara la cabecera
         networkError = e && e.name === "TimeoutError" ? "timed out after " + this.timeout + " s" : errorCause(e);
+        cause = e;
       }
+      const redirect = !networkError && http >= 300 && http < 400; // de una redirección no se lee nada
       let j = null;
-      if (!networkError) {
+      if (!networkError && !redirect) {
         try { j = JSON.parse(resp.toString("utf8")); } catch (e) { j = null; }
       }
-      const isJson = j !== null && typeof j === "object";
-      if (retryable(method, !!networkError, http, isJson ? j : null, idemKey) && attempt <= this.retries) {
+      const isJson = j !== null && typeof j === "object" && !Array.isArray(j);
+      if (!isJson) j = null;
+      if (retryable(method, !!networkError, http, j, idemKey) && attempt <= this.retries) {
+        afterNetwork = afterNetwork || !!networkError || duplicated(http, j);
         await new Promise((ok) => setTimeout(ok, retryWait(r && r.headers.get("retry-after"), attempt) * 1000));
         continue;
       }
-      if (networkError) throw new MundoSMSError("No response from the API: " + networkError);
+      if (networkError) {
+        this.lastRateLimit = null;
+        const err = new MundoSMSError("No response from the API: " + networkError);
+        if (cause) err.cause = cause;
+        throw err;
+      }
+      this.lastRateLimit = rateLimit(r.headers);
+      const rid = r.headers.get("x-request-id");
+      if (redirect) throw new MundoSMSError(redirected(http, r.headers.get("location")), http, null, null, null, null, rid);
       const replayed = String(r.headers.get("idempotent-replayed") || "").trim().toLowerCase() === "true";
       if (replayed && isJson) j.idempotent_replayed = true; // la respuesta guardada de la primera vez: no se ha vuelto a hacer
       if (http >= 200 && http < 300) {
-        if (!isJson) { // un fichero
+        if (!isJson) { // un fichero, o algo que no es de la API
+          if (resp.length && !FILE_TYPES.test(contentType.split(";")[0].trim().toLowerCase())) {
+            throw new MundoSMSError("HTTP " + http + ": the response is not JSON (" + (contentType.split(";")[0].trim() || "no Content-Type") + ")",
+                                    http, null, null, null, null, rid);
+          }
           const file = { status: "success", content_type: contentType, body: resp };
           if (replayed) file.idempotent_replayed = true;
           return file;
         }
         if (j.status !== "error") return j;
       }
-      const rid = r.headers.get("x-request-id");
+      if (method === "DELETE" && afterNetwork && http === 404 && isJson && !String(j.message || "").startsWith("Route not found")) {
+        // lo borró el intento que se quedó sin respuesta
+        return { status: "success", status_code: "0", message: "Already deleted", data: { state: "deleted", changed: false } };
+      }
       if (isJson) throw new MundoSMSError(j.message || "Error", http, j.status_code ?? null, j.detail ?? null, j, j.data ?? null, rid);
       throw new MundoSMSError("HTTP " + http, http, null, null, null, null, rid);
     }
@@ -200,6 +255,16 @@ class MundoSMS {
   }
 }
 
+/**
+ * El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso. Dos peticiones iguales
+ * en el mismo milisegundo (dos a la vez con Promise.all, o un reintento inmediato) firmarían igual, y la API rechazaría la
+ * segunda por repetida («409 Duplicated request»).
+ */
+function timestamp() {
+  lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
+  return String(lastTimestamp);
+}
+
 /** La Idempotency-Key de la llamada: la tuya, si tiene la forma que exige la API; en un POST sin ella, un UUID v4 nuevo. */
 function idempotencyKey(options, method) {
   if (options === null || options === undefined) options = {};
@@ -224,11 +289,35 @@ function idempotencyKey(options, method) {
 function retryable(method, network, http, j, idemKey) {
   if (http === 429) return true;
   const message = j !== null && typeof j.message === "string" ? j.message : null;
-  network = network || (http === 409 && message !== null && message.startsWith("Duplicated request"));
+  network = network || duplicated(http, j);
   if (method === "GET") return network || http >= 500;
   if (method === "PATCH" || method === "DELETE") return network;
   if (idemKey) return network || (http === 409 && message === "Request in progress");
   return false;
+}
+
+/** 409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
+function duplicated(http, j) {
+  return http === 409 && j !== null && typeof j.message === "string" && j.message.startsWith("Duplicated request");
+}
+
+/** El error de una redirección, con adónde mandaba (las redirecciones no se siguen: la API no redirige). */
+function redirected(http, location) {
+  const where = location ? " to " + String(location).trim().slice(0, 300) : "";
+  return "HTTP " + http + ": redirect" + where + " not followed (the API does not redirect: check baseUrl)";
+}
+
+/** El cupo de la respuesta (X-RateLimit-Limit, -Remaining y -Reset, en enteros), o null si no lo trae. */
+function rateLimit(h) {
+  const out = {};
+  let any = false;
+  for (const k of ["limit", "remaining", "reset"]) {
+    const v = h.get("x-ratelimit-" + k);
+    const n = v === null ? NaN : Number(String(v).trim());
+    out[k] = v !== null && String(v).trim() !== "" && Number.isInteger(n) ? n : null;
+    if (out[k] !== null) any = true;
+  }
+  return any ? out : null;
 }
 
 /** RFC 3986: todo codificado menos A-Z a-z 0-9 - . _ ~ (encodeURIComponent deja sin codificar ! ' ( ) *). */
@@ -249,16 +338,41 @@ function queryValue(v) {
 
 /**
  * La ruta codificada trozo a trozo (un %XX ya escrito se respeta), sin el /v3 del principio si la base ya lo lleva, y
- * los parámetros que traiga tras «?».
+ * los parámetros que traiga tras «?»: con su %XX decodificado y el «+» como «+» (RFC 3986; no es un formulario), para que
+ * una fecha con zona escrita en la ruta (from_datetime=…+01:00) llegue tal cual.
  */
 function splitPath(path, stripV3) {
   path = String(path);
   const p = path.indexOf("?");
-  const pathQuery = new Map(p >= 0 ? new URLSearchParams(path.slice(p + 1)) : []);
+  const pathQuery = new Map();
+  if (p >= 0) {
+    for (const pair of path.slice(p + 1).split("&")) {
+      if (!pair) continue;
+      const e = pair.indexOf("=");
+      pathQuery.set(percentDecode(e >= 0 ? pair.slice(0, e) : pair), percentDecode(e >= 0 ? pair.slice(e + 1) : ""));
+    }
+  }
   let encoded = "/" + (p >= 0 ? path.slice(0, p) : path).replace(/^\/+/, "");
   if (stripV3 && (encoded === "/v3" || encoded.startsWith("/v3/"))) encoded = "/" + encoded.slice(3).replace(/^\/+/, "");
   encoded = encoded.split("/").map((seg) => seg.split(/(%[0-9A-Fa-f]{2})/).map((x, i) => (i % 2 ? x : rfc3986(x))).join("")).join("/");
   return [encoded, pathQuery];
+}
+
+/** Un trozo de la query de la ruta: cada %XX, su byte (en UTF-8); lo demás (también el «+») tal cual. */
+function percentDecode(s) {
+  const bytes = [];
+  for (let i = 0; i < s.length; ) {
+    if (s[i] === "%" && /^[0-9A-Fa-f]{2}$/.test(s.slice(i + 1, i + 3))) {
+      bytes.push(parseInt(s.slice(i + 1, i + 3), 16));
+      i += 3;
+    } else {
+      const cp = s.codePointAt(i);
+      const ch = String.fromCodePoint(cp);
+      for (const b of Buffer.from(ch, "utf8")) bytes.push(b);
+      i += ch.length;
+    }
+  }
+  return Buffer.from(bytes).toString("utf8");
 }
 
 /** Segundos antes del siguiente intento: lo que pida Retry-After (segundos o fecha HTTP), o 1, 2, 4… Como mucho 60. */

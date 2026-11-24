@@ -18,7 +18,13 @@
 // la primera vez, r.IdempotentReplayed es true (y r["idempotent_replayed"] también).
 // Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
 // con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como mucho
-// 60 s) o, si no lo trae, 1, 2, 4… s.
+// 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
+// como éxito, con data.changed false.
+// Una redirección (3xx) no se sigue nunca: es una MundoSMSException (la API no redirige, y seguirla llevaría tu firma y tus
+// datos a otro servidor); un HttpClient tuyo que las sigue no se acepta. Un 2xx que no es JSON (el HTML de un proxy o de un
+// portal cautivo) también es un error; los ficheros que da la API (audio, imagen, PDF) vuelven por su Content-Type.
+// Los objetos se mandan con sus nombres de JSON: los de [JsonPropertyName], [JsonProperty] o [DataMember(Name)] y, sin
+// atributo, en snake_case (ClientId → client_id); un objeto anónimo (new { client_id = … }), tal cual.
 // Los avisos que te mandamos (callback_url y webhooks de WhatsApp) se comprueban con MundoSMSClient.VerifyWebhook().
 #if NETCOREAPP3_0_OR_GREATER || NETSTANDARD2_1_OR_GREATER
 #nullable disable
@@ -48,6 +54,11 @@ namespace MundoSMS
     /// </summary>
     public class MundoSMSException : Exception
     {
+        /// <summary>Crea el error sin respuesta de la API, con la excepción de debajo (la de la red, o la del plazo).</summary>
+        public MundoSMSException(string message, Exception innerException) : base(message, innerException)
+        {
+        }
+
         /// <summary>Crea el error. Lo normal es no crearlo tú: lo lanza <see cref="MundoSMSClient"/>.</summary>
         public MundoSMSException(string message, int http = 0, string statusCode = null, string detail = null,
                                  Dictionary<string, object> response = null, Dictionary<string, object> data = null,
@@ -122,6 +133,32 @@ namespace MundoSMS
         public bool IdempotentReplayed { get; internal set; }
     }
 
+    /// <summary>El cupo que dijo una respuesta: sus cabeceras <c>X-RateLimit-*</c> (<see cref="MundoSMSClient.LastRateLimit"/>).</summary>
+    public sealed class MundoSMSRateLimit
+    {
+        internal MundoSMSRateLimit(long? limit, long? remaining, long? reset)
+        {
+            Limit = limit;
+            Remaining = remaining;
+            Reset = reset;
+        }
+
+        /// <summary><c>X-RateLimit-Limit</c>: las peticiones por segundo que admite tu clave; null si no lo traía.</summary>
+        public long? Limit { get; private set; }
+
+        /// <summary><c>X-RateLimit-Remaining</c>: las que te quedan en este segundo, contada esta; null si no lo traía.</summary>
+        public long? Remaining { get; private set; }
+
+        /// <summary><c>X-RateLimit-Reset</c>: los segundos que faltan para que se reponga el cupo; null si no lo traía.</summary>
+        public long? Reset { get; private set; }
+
+        /// <summary>El cupo en una línea.</summary>
+        public override string ToString()
+        {
+            return "MundoSMSRateLimit { Limit = " + Limit + ", Remaining = " + Remaining + ", Reset = " + Reset + " }";
+        }
+    }
+
     /// <summary>
     /// Opciones de una petición, para <see cref="MundoSMSClient.PostAsync(string, object, MundoSMSRequestOptions, CancellationToken)"/>
     /// y <see cref="MundoSMSClient.RequestAsync(string, string, object, MundoSMSRequestOptions, CancellationToken)"/>:
@@ -147,12 +184,13 @@ namespace MundoSMS
     /// <summary>
     /// Cliente de la API REST v3 de MundoSMS. Firma cada petición (<c>X-Timestamp</c> en milisegundos y la firma HMAC de tu
     /// API Key) y reintenta solo lo que es seguro repetir. Crea uno y reutilízalo: se puede usar desde varios hilos a la vez
-    /// (<see cref="LastCursor"/> es el del último <see cref="All"/> que acabó, sea del hilo que sea).
+    /// (<see cref="LastCursor"/> y <see cref="LastRateLimit"/> son los del último recorrido y la última respuesta, sean del hilo
+    /// que sean).
     /// </summary>
     public class MundoSMSClient
     {
         /// <summary>La versión del SDK.</summary>
-        public const string Version = "1.0.0";
+        public const string Version = "1.2.0";
 
         /// <summary>Los segundos que puede alejarse de tu hora la «t» de la firma de un aviso, si no dices otra cosa.</summary>
         public const long WebhookTolerance = 300;
@@ -160,6 +198,7 @@ namespace MundoSMS
         private const double MaxRetryDelay = 60;   // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
 
         private static readonly Lazy<HttpClient> SharedHttpClient = new Lazy<HttpClient>(CreateHttpClient);
+        private static long lastTimestamp;   // el X-Timestamp de la última petición de este proceso (milisegundos)
 
         private readonly string token;
         private readonly string privateKey;
@@ -172,16 +211,50 @@ namespace MundoSMS
         /// <param name="token">el Token de tu API Key (empieza por eyJ)</param>
         /// <param name="privateKey">su clave privada si la API Key exige firma (lo normal); "" si no</param>
         /// <param name="httpClient">
-        /// opcional: tu propio <see cref="HttpClient"/> (por ejemplo, de <c>IHttpClientFactory</c>). Sin él, todos los
-        /// clientes comparten uno. El plazo de cada petición lo pone <see cref="Timeout"/>; el <c>Timeout</c> del tuyo también
-        /// cuenta, si es menor.
+        /// opcional: tu propio <see cref="HttpClient"/> (por ejemplo, de <c>IHttpClientFactory</c>), que NO siga redirecciones:
+        /// creado con <c>AllowAutoRedirect = false</c> en su manejador (si las sigue, <see cref="ArgumentException"/>). Sin él,
+        /// todos los clientes comparten uno. El plazo de cada petición lo pone <see cref="Timeout"/>; el <c>Timeout</c> del tuyo
+        /// también cuenta, si es menor.
         /// </param>
+        /// <exception cref="ArgumentException">tu <see cref="HttpClient"/> sigue redirecciones</exception>
         public MundoSMSClient(string token, string privateKey = "", HttpClient httpClient = null)
         {
             if (token == null) throw new ArgumentNullException(nameof(token));
+            // una redirección llevaría a otro servidor la firma, la Idempotency-Key y, con un 307, el cuerpo: no se sigue nunca
+            if (httpClient != null && FollowsRedirects(httpClient) == true)
+                throw new ArgumentException("MundoSMS: your HttpClient follows redirects, and the SDK never follows them (they would take the " +
+                                            "signature and the body to another server): create its handler with AllowAutoRedirect = false", nameof(httpClient));
             this.token = token.Trim();
             this.privateKey = (privateKey ?? "").Trim();
             this.httpClient = httpClient ?? SharedHttpClient.Value;
+        }
+
+        /// <summary>
+        /// Si el <see cref="HttpClient"/> sigue redirecciones: el <c>AllowAutoRedirect</c> del manejador de debajo (pasando por los
+        /// <see cref="DelegatingHandler"/> de <c>IHttpClientFactory</c>). null si no se sabe; entonces lo vigila cada respuesta.
+        /// </summary>
+        private static bool? FollowsRedirects(HttpMessageInvoker client)
+        {
+            try
+            {
+                HttpMessageHandler handler = null;
+                foreach (string name in new[] { "_handler", "handler" })
+                {
+                    var field = typeof(HttpMessageInvoker).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+                    if (field == null) continue;
+                    handler = field.GetValue(client) as HttpMessageHandler;
+                    break;
+                }
+                for (int depth = 0; handler is DelegatingHandler && depth < 64; depth++) handler = ((DelegatingHandler)handler).InnerHandler;
+                if (handler == null) return null;
+                var property = handler.GetType().GetProperty("AllowAutoRedirect", BindingFlags.Instance | BindingFlags.Public);
+                if (property == null || property.PropertyType != typeof(bool)) return null;
+                return (bool)property.GetValue(handler, null);
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         /// <summary>La dirección de la API. Por defecto, https://api.mundosms.es/v3.</summary>
@@ -191,7 +264,11 @@ namespace MundoSMS
             set
             {
                 if (value == null) throw new ArgumentNullException(nameof(value));
-                baseUrl = value.Trim().TrimEnd('/');
+                string v = value.Trim().TrimEnd('/');
+                Uri u;
+                if (!Uri.TryCreate(v, UriKind.Absolute, out u) || (u.Scheme != "https" && u.Scheme != "http") || u.Query.Length > 0 || u.Fragment.Length > 0)
+                    throw new ArgumentException("MundoSMS: BaseUrl must be an http(s) address without query, like https://api.mundosms.es/v3", nameof(value));
+                baseUrl = v;
             }
         }
 
@@ -222,10 +299,18 @@ namespace MundoSMS
         }
 
         /// <summary>
-        /// El <c>next_cursor</c> del último listado recorrido con <see cref="All"/>: guárdalo y pásalo como <c>cursor</c> la
-        /// próxima vez para pedir solo lo nuevo.
+        /// El cursor del último listado recorrido con <see cref="All"/>: guárdalo y pásalo como <c>cursor</c> la próxima vez para
+        /// pedir solo lo nuevo. Al empezar el recorrido, el <c>cursor</c> que le pasas (o null); después, el último
+        /// <c>next_cursor</c> que llegó (una página sin cursor no lo borra). Uno por cliente: para dos recorridos a la vez, un
+        /// cliente para cada uno.
         /// </summary>
         public string LastCursor { get; private set; }
+
+        /// <summary>
+        /// El cupo que dijo la última respuesta (sus cabeceras <c>X-RateLimit-*</c>), o null si no lo traía (o no hubo
+        /// respuesta). Con él, un bucle propio no se pasa de las 10 peticiones por segundo.
+        /// </summary>
+        public MundoSMSRateLimit LastRateLimit { get; private set; }
 
         // ---- asíncronos ----
 
@@ -303,7 +388,12 @@ namespace MundoSMS
         /// <summary>
         /// Recorre un listado entero, página a página, siguiendo su cursor (<c>next_cursor</c>), y da los elementos uno a uno
         /// (se piden a medida que avanzas). Cada página lleva los mismos filtros (y el mismo <c>order</c>) más el cursor. Al
-        /// acabar, el último <c>next_cursor</c> queda en <see cref="LastCursor"/>.
+        /// acabar, el último <c>next_cursor</c> queda en <see cref="LastCursor"/>, que avanza cuando ya te ha dado todos los
+        /// elementos de una página. Termina con <c>has_more</c> false (con <c>stop_at_ongoing</c>, también cuando la página se
+        /// para en una llamada en curso) o si el cursor no avanza: una página vacía con <c>has_more</c> true no es el final.
+        /// Una lista que no va por páginas
+        /// (<c>has_more</c> sin <c>next_cursor</c>: <c>/calls/missed</c>, <c>/calls/live</c>) es una
+        /// <see cref="MundoSMSException"/>, antes de ningún elemento: sube <c>limit</c>, o filtra, y pídela con <see cref="Get"/>.
         /// </summary>
         public IEnumerable<Dictionary<string, object>> All(string path, object query = null)
         {
@@ -313,14 +403,17 @@ namespace MundoSMS
         private IEnumerable<Dictionary<string, object>> AllPages(string path, Dictionary<string, object> query)
         {
             query = new Dictionary<string, object>(query, StringComparer.Ordinal);
+            LastCursor = StartCursor(query);
             string listKey = null;
             while (true)
             {
-                var data = Get(path, query).Data ?? new Dictionary<string, object>();
+                var r = Get(path, query);
+                var data = r.Data ?? new Dictionary<string, object>();
+                CheckPaginated(path, r, data);
                 if (listKey == null) listKey = FirstList(data);
                 foreach (var item in Items(data, listKey)) yield return item;
                 object next;
-                if (!NextPage(data, out next)) yield break;
+                if (!NextPage(data, query, out next)) yield break;
                 query["cursor"] = next;
             }
         }
@@ -337,18 +430,43 @@ namespace MundoSMS
                                                                                  [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             query = new Dictionary<string, object>(query, StringComparer.Ordinal);
+            LastCursor = StartCursor(query);
             string listKey = null;
             while (true)
             {
-                var data = (await GetAsync(path, query, cancellationToken).ConfigureAwait(false)).Data ?? new Dictionary<string, object>();
+                var r = await GetAsync(path, query, cancellationToken).ConfigureAwait(false);
+                var data = r.Data ?? new Dictionary<string, object>();
+                CheckPaginated(path, r, data);
                 if (listKey == null) listKey = FirstList(data);
                 foreach (var item in Items(data, listKey)) yield return item;
                 object next;
-                if (!NextPage(data, out next)) yield break;
+                if (!NextPage(data, query, out next)) yield break;
                 query["cursor"] = next;
             }
         }
 #endif
+
+        /// <summary>El cursor de un recorrido al empezar: el que le pasas, o null.</summary>
+        private static string StartCursor(Dictionary<string, object> query)
+        {
+            object start;
+            string s = query.TryGetValue("cursor", out start) && start != null ? Convert.ToString(start, CultureInfo.InvariantCulture) : null;
+            return string.IsNullOrEmpty(s) ? null : s;
+        }
+
+        /// <summary>Una lista que no va por páginas (has_more sin next_cursor) no se puede recorrer entera.</summary>
+        private static void CheckPaginated(string path, MundoSMSResponse r, Dictionary<string, object> data)
+        {
+            object hasMore, results, cursor, statusCode;
+            data.TryGetValue("has_more", out hasMore);
+            data.TryGetValue("results", out results);
+            data.TryGetValue("next_cursor", out cursor);
+            if (!Truthy(hasMore) || !Truthy(results) || Truthy(cursor)) return;
+            r.TryGetValue("status_code", out statusCode);
+            throw new MundoSMSException("MundoSMS: all() cannot go through " + path + ": it has more (has_more) but no next_cursor, so the list " +
+                                        "is not paginated: raise limit or narrow the filters, and read it with Get", r.Http,
+                                        statusCode == null ? null : ToText(statusCode), null, r, data, r.RequestId);
+        }
 
         /// <summary>La lista de una página: el primer campo de <c>data</c> que es una lista (calls, dids…).</summary>
         private static string FirstList(Dictionary<string, object> data)
@@ -371,15 +489,18 @@ namespace MundoSMS
             }
         }
 
-        /// <summary>Guarda el cursor y dice si hay otra página (has_more, results distinto de 0 y next_cursor).</summary>
-        private bool NextPage(Dictionary<string, object> data, out object cursor)
+        /// <summary>Guarda el cursor (cuando ya se han dado todos los elementos de la página) y dice si hay otra: has_more, un
+        /// next_cursor que avanza y sin llamada en curso (ongoing_call). Una página vacía con has_more true no es el final.</summary>
+        private bool NextPage(Dictionary<string, object> data, Dictionary<string, object> query, out object cursor)
         {
-            object hasMore, results;
+            object hasMore, ongoing, sent;
             data.TryGetValue("next_cursor", out cursor);
             data.TryGetValue("has_more", out hasMore);
-            data.TryGetValue("results", out results);
-            LastCursor = cursor == null ? null : Convert.ToString(cursor, CultureInfo.InvariantCulture);
-            return Truthy(hasMore) && Truthy(results) && Truthy(cursor);
+            data.TryGetValue("ongoing_call", out ongoing);
+            query.TryGetValue("cursor", out sent);
+            string c = Truthy(cursor) ? Convert.ToString(cursor, CultureInfo.InvariantCulture) : null;
+            if (c != null) LastCursor = c;
+            return Truthy(hasMore) && c != null && !(sent != null && c == Convert.ToString(sent, CultureInfo.InvariantCulture)) && !Truthy(ongoing);
         }
 
         private static bool Truthy(object v)
@@ -448,18 +569,21 @@ namespace MundoSMS
             string signedPath = uri.PathAndQuery;   // lo que se firma es justo lo que se manda
             var httpMethod = new HttpMethod(method);
             TimeSpan limit = timeout;
+            bool afterNetwork = false;   // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
             for (int attempt = 1; ; attempt++)
             {
                 int httpStatus = 0;
-                string contentType = "", retryAfter = null, requestId = null, networkError = null;
+                string contentType = "", retryAfter = null, requestId = null, networkError = null, location = null, redirectedTo = null;
                 bool replayed = false;
                 byte[] responseBody = null;
+                Exception networkException = null;
+                MundoSMSRateLimit rateLimit = null;
                 using (var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 using (var request = new HttpRequestMessage(httpMethod, uri))
                 {
                     if (limit != System.Threading.Timeout.InfiniteTimeSpan) cts.CancelAfter(limit);
-                    // milisegundos: dos peticiones iguales seguidas no firman igual
-                    string ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(CultureInfo.InvariantCulture);
+                    // dos peticiones iguales a la vez, o un reintento inmediato, no firman igual
+                    string ts = Timestamp();
                     request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + token);
                     request.Headers.TryAddWithoutValidation("X-Timestamp", ts);
                     request.Headers.TryAddWithoutValidation("Accept", "application/json");
@@ -481,6 +605,12 @@ namespace MundoSMS
                         retryAfter = GetHeader(response, "Retry-After");
                         requestId = GetHeader(response, "X-Request-Id");
                         replayed = string.Equals((GetHeader(response, "Idempotent-Replayed") ?? "").Trim(), "true", StringComparison.OrdinalIgnoreCase);
+                        location = GetHeader(response, "Location");
+                        rateLimit = ReadRateLimit(response);
+                        // un HttpClient que siguió una redirección (uno que no se pudo comprobar al crear el cliente): lo de otro
+                        // servidor no se toma por la respuesta de la API
+                        if (response.RequestMessage != null && response.RequestMessage.RequestUri != null && !uri.Equals(response.RequestMessage.RequestUri))
+                            redirectedTo = response.RequestMessage.RequestUri.AbsoluteUri;
                         responseBody = await WithDeadline(ReadAll(response.Content, cts.Token), cts.Token).ConfigureAwait(false);
                     }
                     catch (Exception e) when (IsNetworkError(e) || cts.IsCancellationRequested)
@@ -489,6 +619,7 @@ namespace MundoSMS
                         networkError = cts.IsCancellationRequested ? "timed out after " + Seconds(limit) + " s"
                                      : e is OperationCanceledException ? "timed out (the HttpClient's Timeout)"
                                      : NetworkErrorReason(e);
+                        networkException = e;
                     }
                     finally
                     {
@@ -496,20 +627,40 @@ namespace MundoSMS
                     }
                 }
                 if (networkError != null) httpStatus = 0;   // se cortó a medias: es un fallo de red aunque llegara la cabecera
+                bool redirect = networkError == null && (redirectedTo != null || (httpStatus >= 300 && httpStatus < 400));
                 object parsed;
-                var obj = networkError == null && Json.TryParse(responseBody, out parsed) ? parsed as Dictionary<string, object> : null;
-                if (IsRetryable(method, networkError != null, httpStatus, obj, idempotencyKey) && attempt <= retries)
+                var obj = networkError == null && !redirect && Json.TryParse(responseBody, out parsed) ? parsed as Dictionary<string, object> : null;
+                if (!redirect && IsRetryable(method, networkError != null, httpStatus, obj, idempotencyKey) && attempt <= retries)
                 {
+                    afterNetwork = afterNetwork || networkError != null || IsDuplicated(httpStatus, obj);
                     await Task.Delay(RetryDelay(retryAfter, attempt), cancellationToken).ConfigureAwait(false);
                     continue;
                 }
-                if (networkError != null) throw new MundoSMSException("No response from the API: " + networkError);
+                if (networkError != null)
+                {
+                    LastRateLimit = null;
+                    throw new MundoSMSException("No response from the API: " + networkError, networkException);
+                }
+                LastRateLimit = rateLimit;
+                if (redirect)   // no se sigue: llevaría la firma y los datos a otro servidor
+                {
+                    string to = (redirectedTo ?? location ?? "").Trim();
+                    if (to.Length > 300) to = to.Substring(0, 300);
+                    throw new MundoSMSException("HTTP " + httpStatus.ToString(CultureInfo.InvariantCulture) + ": redirect" + (to.Length > 0 ? " to " + to : "") +
+                                                " not followed (the API does not redirect: check BaseUrl" +
+                                                (redirectedTo != null ? ", and create your HttpClient with AllowAutoRedirect = false" : "") + ")",
+                                                httpStatus, null, null, null, null, requestId);
+                }
                 if (replayed && obj != null) obj["idempotent_replayed"] = true;   // la respuesta guardada de la primera vez
                 if (httpStatus >= 200 && httpStatus < 300)
                 {
                     var result = new MundoSMSResponse { Http = httpStatus, ContentType = contentType, RequestId = requestId, IdempotentReplayed = replayed };
-                    if (obj == null)   // un fichero
+                    if (obj == null)   // un fichero, o algo que no es de la API
                     {
+                        string type = contentType.Split(';')[0].Trim();
+                        if (responseBody != null && responseBody.Length > 0 && !IsFileType(type))
+                            throw new MundoSMSException("HTTP " + httpStatus.ToString(CultureInfo.InvariantCulture) + ": the response is not JSON (" +
+                                                        (type.Length > 0 ? type : "no Content-Type") + ")", httpStatus, null, null, null, null, requestId);
                         result.Body = responseBody;
                         result["status"] = "success";
                         result["content_type"] = contentType;
@@ -523,6 +674,18 @@ namespace MundoSMS
                         foreach (var kv in obj) result[kv.Key] = kv.Value;
                         return result;
                     }
+                }
+                object deleteMessage = null;
+                if (method == "DELETE" && afterNetwork && httpStatus == 404 && obj != null
+                    && !(obj.TryGetValue("message", out deleteMessage) && deleteMessage is string && ((string)deleteMessage).StartsWith("Route not found", StringComparison.Ordinal)))
+                {
+                    // lo borró el intento que se quedó sin respuesta (Http es el 404 de la API)
+                    var deleted = new MundoSMSResponse { Http = httpStatus, ContentType = contentType, RequestId = requestId };
+                    deleted["status"] = "success";
+                    deleted["status_code"] = "0";
+                    deleted["message"] = "Already deleted";
+                    deleted["data"] = new Dictionary<string, object>(StringComparer.Ordinal) { { "state", "deleted" }, { "changed", false } };
+                    return deleted;
                 }
                 if (obj != null)
                 {
@@ -552,11 +715,46 @@ namespace MundoSMS
             if (httpStatus == 429) return true;
             object m;
             string message = json != null && json.TryGetValue("message", out m) ? m as string : null;
-            network = network || (httpStatus == 409 && message != null && message.StartsWith("Duplicated request", StringComparison.Ordinal));
+            network = network || IsDuplicated(httpStatus, json);
             if (method == "GET") return network || httpStatus >= 500;
             if (method == "PATCH" || method == "DELETE") return network;
             if (idempotencyKey != null) return network || (httpStatus == 409 && message == "Request in progress");
             return false;
+        }
+
+        /// <summary>409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias).</summary>
+        private static bool IsDuplicated(int httpStatus, Dictionary<string, object> json)
+        {
+            object m;
+            string message = json != null && json.TryGetValue("message", out m) ? m as string : null;
+            return httpStatus == 409 && message != null && message.StartsWith("Duplicated request", StringComparison.Ordinal);
+        }
+
+        /// <summary>Lo que la API da como fichero (grabaciones, locuciones, diagramas y el PDF de un certificado), por su Content-Type.</summary>
+        private static bool IsFileType(string type)
+        {
+            string t = type.ToLowerInvariant();
+            return t.StartsWith("audio/", StringComparison.Ordinal) || t.StartsWith("image/", StringComparison.Ordinal)
+                || t == "application/pdf" || t == "application/octet-stream";
+        }
+
+        /// <summary>El cupo de la respuesta (X-RateLimit-Limit, -Remaining y -Reset), o null si no lo trae.</summary>
+        private static MundoSMSRateLimit ReadRateLimit(HttpResponseMessage response)
+        {
+            var values = new long?[3];
+            bool any = false;
+            string[] names = { "X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset" };
+            for (int i = 0; i < 3; i++)
+            {
+                long n;
+                string v = GetHeader(response, names[i]);
+                if (v != null && long.TryParse(v.Trim(), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out n))
+                {
+                    values[i] = n;
+                    any = true;
+                }
+            }
+            return any ? new MundoSMSRateLimit(values[0], values[1], values[2]) : null;
         }
 
         /// <summary>La Idempotency-Key, si tiene la forma que exige la API (de 1 a 64: A-Z a-z 0-9 _ . : -).</summary>
@@ -633,15 +831,39 @@ namespace MundoSMS
             return valid;
         }
 
-        /// <summary>Compara en tiempo constante (lo que hace CryptographicOperations.FixedTimeEquals, que .NET Framework no tiene).</summary>
+        /// <summary>
+        /// El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso (también desde
+        /// varios hilos). Dos peticiones iguales en el mismo milisegundo (dos a la vez, o un reintento tras un 429 con
+        /// Retry-After: 0) firmarían igual, y la API rechazaría la segunda por repetida («409 Duplicated request»).
+        /// </summary>
+        private static string Timestamp()
+        {
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            while (true)
+            {
+                long previous = Interlocked.Read(ref lastTimestamp);
+                long next = Math.Max(now, previous + 1);
+                if (Interlocked.CompareExchange(ref lastTimestamp, next, previous) == previous)
+                    return next.ToString(CultureInfo.InvariantCulture);
+            }
+        }
+
+        /// <summary>
+        /// Compara en tiempo constante: CryptographicOperations.FixedTimeEquals donde está y, en .NET Framework y .NET
+        /// Standard 2.0, que no lo tienen, lo mismo a mano (sin optimizar, para que no corte en el primer byte distinto).
+        /// </summary>
         [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining
                                                     | System.Runtime.CompilerServices.MethodImplOptions.NoOptimization)]
         private static bool FixedTimeEquals(byte[] a, byte[] b)
         {
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            return CryptographicOperations.FixedTimeEquals(a, b);
+#else
             if (a.Length != b.Length) return false;
             int diff = 0;
             for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
             return diff == 0;
+#endif
         }
 
         private string Sign(string ts, string method, string signedPath, byte[] body)
@@ -812,9 +1034,13 @@ namespace MundoSMS
             encodedPath = string.Join("/", segments);
         }
 
+        /// <summary>
+        /// Un trozo de la query de la ruta: cada %XX, su byte; lo demás, también el «+», tal cual (RFC 3986: no es un
+        /// formulario), para que una fecha con zona escrita en la ruta (from_datetime=…+01:00) llegue tal cual.
+        /// </summary>
         private static string DecodeQueryPart(string s)
         {
-            return Uri.UnescapeDataString(s.Replace('+', ' '));
+            return Uri.UnescapeDataString(s);
         }
 
         /// <summary>La query en RFC 3986 (todo codificado menos A-Z a-z 0-9 - . _ ~): es lo que se firma y lo que se manda.</summary>
@@ -958,7 +1184,7 @@ namespace MundoSMS
             }
             if (data is string || data is IEnumerable || Json.IsScalar(data))
                 throw new ArgumentException("MundoSMS: " + what + " must be a dictionary or an anonymous object (new { type = \"in\" })");
-            foreach (var p in Json.Properties(data.GetType())) result[p.Name] = p.GetValue(data, null);
+            foreach (var kv in Json.Members(data)) result[kv.Key] = kv.Value;
             return result;
         }
     }
@@ -1161,6 +1387,79 @@ namespace MundoSMS
                 if (p.CanRead && p.GetIndexParameters().Length == 0) yield return p;
         }
 
+        /// <summary>
+        /// Las propiedades públicas de un objeto con su nombre en el JSON: el de [JsonPropertyName] (System.Text.Json),
+        /// [JsonProperty] (Newtonsoft) o [DataMember(Name)]; sin él, en snake_case (ClientId → client_id), salvo en un objeto
+        /// anónimo, que ya lleva los nombres de la API. Sin las de [JsonIgnore] o [IgnoreDataMember] y, en una clase con
+        /// [DataContract], solo las de [DataMember]. Los atributos se buscan por su nombre: sin depender de esas bibliotecas.
+        /// </summary>
+        internal static IEnumerable<KeyValuePair<string, object>> Members(object data)
+        {
+            var type = data.GetType();
+            bool anonymous = type.Name.Contains("AnonymousType") && type.IsDefined(typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute), false);
+            bool contract = FindAttribute(type, "DataContractAttribute") != null;
+            foreach (var p in Properties(type))
+            {
+                object value = p.GetValue(data, null);
+                if (Ignored(p, value) || FindAttribute(p, "IgnoreDataMemberAttribute") != null) continue;
+                var dataMember = FindAttribute(p, "DataMemberAttribute");
+                if (contract && dataMember == null) continue;
+                string name = AttributeText(FindAttribute(p, "JsonPropertyNameAttribute"), "Name")
+                              ?? AttributeText(FindAttribute(p, "JsonPropertyAttribute"), "PropertyName")
+                              ?? AttributeText(dataMember, "Name");
+                yield return new KeyValuePair<string, object>(name ?? (anonymous ? p.Name : SnakeCase(p.Name)), value);
+            }
+        }
+
+        /// <summary>[JsonIgnore]: el de Newtonsoft siempre; el de System.Text.Json, según su Condition.</summary>
+        private static bool Ignored(PropertyInfo p, object value)
+        {
+            var a = FindAttribute(p, "JsonIgnoreAttribute");
+            if (a == null) return false;
+            var c = a.GetType().GetProperty("Condition");
+            string condition = c == null ? "Always" : Convert.ToString(c.GetValue(a, null), CultureInfo.InvariantCulture);
+            if (condition == "Never") return false;
+            if (condition == "WhenWritingNull") return value == null;
+            if (condition == "WhenWritingDefault") return value == null || (value.GetType().IsValueType && value.Equals(Activator.CreateInstance(value.GetType())));
+            return true;
+        }
+
+        private static object FindAttribute(MemberInfo member, string name)
+        {
+            foreach (var a in member.GetCustomAttributes(true)) if (a.GetType().Name == name) return a;
+            return null;
+        }
+
+        private static string AttributeText(object attribute, string property)
+        {
+            if (attribute == null) return null;
+            var p = attribute.GetType().GetProperty(property);
+            string s = p == null ? null : p.GetValue(attribute, null) as string;
+            return string.IsNullOrEmpty(s) ? null : s;
+        }
+
+        /// <summary>ClientId → client_id, SMSText → sms_text, Url2 → url2 (lo que ya va en minúsculas, tal cual).</summary>
+        internal static string SnakeCase(string name)
+        {
+            var sb = new StringBuilder(name.Length + 4);
+            for (int i = 0; i < name.Length; i++)
+            {
+                char c = name[i];
+                if (char.IsUpper(c))
+                {
+                    bool afterLower = i > 0 && (char.IsLower(name[i - 1]) || char.IsDigit(name[i - 1]));
+                    bool acronymEnd = i > 0 && char.IsUpper(name[i - 1]) && i + 1 < name.Length && char.IsLower(name[i + 1]);
+                    if ((afterLower || acronymEnd) && sb.Length > 0 && sb[sb.Length - 1] != '_') sb.Append('_');
+                    sb.Append(char.ToLowerInvariant(c));
+                }
+                else
+                {
+                    sb.Append(c);
+                }
+            }
+            return sb.ToString();
+        }
+
         private static void Write(StringBuilder sb, object v, int depth)
         {
             if (depth > 64) throw new ArgumentException("MundoSMS: the data is nested too deeply (an object that contains itself?)");
@@ -1198,8 +1497,8 @@ namespace MundoSMS
                 sb.Append(']');
                 return;
             }
-            var obj = new Dictionary<string, object>(StringComparer.Ordinal);   // un objeto: sus propiedades públicas
-            foreach (var p in Properties(v.GetType())) obj[p.Name] = p.GetValue(v, null);
+            var obj = new Dictionary<string, object>(StringComparer.Ordinal);   // un objeto: sus propiedades públicas, con su nombre de JSON
+            foreach (var kv in Members(v)) obj[kv.Key] = kv.Value;
             WriteObject(sb, obj, depth);
         }
 

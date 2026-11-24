@@ -1,0 +1,126 @@
+# Las pruebas de los siete clientes en cada PR y en cada push a main. Sin red hacia la API: cada una levanta su servidor de
+# prueba local, que comprueba la firma. Con la versión más vieja que promete cada cliente y con la de hoy, en sus imágenes
+# oficiales (fijadas). Solo lee el repositorio.
+name: Pruebas
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        imagen: ["php:7.4.33-cli", "php:8.5.12-cli"]
+    container: ${{ matrix.imagen }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: php tests/php/test_mundosms.php
+
+  python:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        imagen: ["python:3.9.25-slim", "python:3.13.18-slim"]
+    container: ${{ matrix.imagen }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: python3 -I tests/python/test_mundosms.py
+
+  node:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        imagen: ["node:18.20.8-slim", "node:24.22.0-trixie-slim"]
+    container: ${{ matrix.imagen }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: node tests/node/test_mundosms.js
+
+  java:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        imagen: ["eclipse-temurin:8u504-b01-jdk", "eclipse-temurin:21.0.12.1_1-jdk"]
+    container: ${{ matrix.imagen }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compilar sin avisos y probar
+        run: |
+          mkdir -p "$RUNNER_TEMP/c"
+          javac -encoding UTF-8 -Xlint:all -Xlint:-options -Werror -d "$RUNNER_TEMP/c" java/MundoSMS.java tests/java/MundoSMSTest.java
+          java -cp "$RUNNER_TEMP/c" MundoSMSTest
+
+  dotnet:
+    runs-on: ubuntu-24.04
+    container: mcr.microsoft.com/dotnet/sdk:8.0.428
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: dotnet run -c Release --project tests/dotnet/MundoSMS.Tests.csproj
+
+  go:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        imagen: ["golang:1.22.12-bookworm", "golang:1.27.2-trixie"]
+    container: ${{ matrix.imagen }}
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=mod
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: gofmt, go vet y go test
+        run: |
+          f=$(gofmt -l .); if [ -n "$f" ]; then echo "gofmt: $f"; exit 1; fi
+          go vet ./...
+          go test -count=1 ./...
+
+  ruby:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        imagen: ["ruby:3.1.7-slim", "ruby:4.0.9-slim"]
+    container: ${{ matrix.imagen }}
+    defaults:
+      run:
+        working-directory: ruby
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pruebas, sin un aviso de Ruby
+        run: |
+          ruby -w -Ilib test/test_mundosms.rb > "$RUNNER_TEMP/t.txt" 2>&1; r=$?
+          cat "$RUNNER_TEMP/t.txt"
+          if grep -q "warning:" "$RUNNER_TEMP/t.txt"; then echo "hay avisos de Ruby"; exit 1; fi
+          exit $r
