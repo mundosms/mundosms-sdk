@@ -10,18 +10,19 @@
 #   puts r["data"]["id"]
 #   api.all("/calls", { "from_datetime" => "2026-11-01", "stop_at_ongoing" => true }).each { |call| ... }
 #
-# Errores: excepción MundoSMS::Error con #http (código HTTP), #status_code ("3", "4"…), #message, #detail, #data, #response
-# (la respuesta entera) y #request_id (la cabecera X-Request-Id). También cuando la API contesta con "status": "error",
+# Errores: excepción MundoSMS::Error con #http (código HTTP), #code (la palabra de la API: "not_found", "invalid_parameter"…),
+# #message, #detail, #data, #response (la respuesta entera) y #request_id (la cabecera X-Request-Id). También cuando la API contesta con "status": "error",
 # venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta, con
 # data["state"] "unknown". Lo que no se puede mandar (una Idempotency-Key mal formada, un cuerpo que no es UTF-8) es un
 # ArgumentError, y no se manda nada.
 # Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
-# api.post(path, data, idempotency_key: "pedido-881")). Por eso un POST que falla por la red, o con 409 «Request in
-# progress», se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
+# api.post(path, data, idempotency_key: "pedido-881")). Por eso un POST que falla por la red, o con 409
+# request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
 # "idempotent_replayed" => true.
 # Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un
-# POST con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como
-# mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho:
+# POST con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
+# repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
+# diga Retry-After (como mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho:
 # vuelve como éxito, con data["changed"] false.
 # Una redirección (3xx) no se sigue nunca: es un MundoSMS::Error (la API no redirige). Un 2xx que no es JSON (el HTML de un
 # proxy o de un portal cautivo) también es un error; los ficheros que da la API (audio, imagen, PDF) vuelven por su
@@ -37,7 +38,7 @@ require "timeout"
 require "uri"
 
 module MundoSMS
-  VERSION = "1.2.0"
+  VERSION = "2.0.0"
   DEFAULT_BASE_URL = "https://api.mundosms.es/v3"
   MAX_RETRY_WAIT = 60      # segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
   WEBHOOK_TOLERANCE = 300  # segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
@@ -48,16 +49,16 @@ module MundoSMS
   # plazo agotado), http 0 y un mensaje que empieza por «No response from the API:».
   class Error < StandardError
     attr_reader :http,         # el código HTTP; 0 si no hubo respuesta
-                :status_code,  # el status_code de la API, como texto ("3", "4", "12"…)
+                :code,         # el code de la API ("not_found", "invalid_parameter"…); nil si la respuesta no lo trae
                 :detail,       # el detail de la respuesta, si lo trae
                 :data,         # el data de la respuesta (en WhatsApp, el id del mensaje que puede haber salido)
                 :response,     # la respuesta entera, decodificada; nil si no era JSON
                 :request_id    # la cabecera X-Request-Id: con ella encuentras la petición en Logs API
 
-    def initialize(message, http: 0, status_code: nil, detail: nil, data: nil, response: nil, request_id: nil)
+    def initialize(message, http: 0, code: nil, detail: nil, data: nil, response: nil, request_id: nil)
       super(message)
       @http = http
-      @status_code = status_code
+      @code = code
       @detail = detail
       @data = data
       @response = response
@@ -70,7 +71,7 @@ module MundoSMS
 
   # El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso (también desde
   # varios hilos). Dos peticiones iguales en el mismo milisegundo (un reintento tras un 429 con Retry-After: 0, o dos a la
-  # vez) firmarían igual, y la API rechazaría la segunda por repetida («409 Duplicated request»).
+  # vez) firmarían igual, y la API rechazaría la segunda por repetida («409 duplicated_request»).
   def self.timestamp
     @timestamp_lock.synchronize do
       @last_timestamp = [Process.clock_gettime(Process::CLOCK_REALTIME, :millisecond), @last_timestamp + 1].max
@@ -199,7 +200,7 @@ module MundoSMS
           if truthy(data["has_more"]) && truthy(data["results"]) && !truthy(cursor)
             message = "MundoSMS: all() cannot go through #{path}: it has more (has_more) but no next_cursor, so the list is not " \
                       "paginated: raise limit or narrow the filters, and read it with get"
-            raise Error.new(message, http: 200, status_code: text(r["status_code"]), data: data, response: r)
+            raise Error.new(message, http: 200, data: data, response: r)
           end
           list_key ||= data.keys.find { |k| data[k].is_a?(Array) } # la lista es el primer campo que es una lista
           (list_key && data[list_key].is_a?(Array) ? data[list_key] : []).each { |item| y << item }
@@ -281,14 +282,13 @@ module MundoSMS
           end
           return j unless j["status"] == "error"
         end
-        if method == "DELETE" && after_network && status == 404 && j.is_a?(Hash) && !j["message"].to_s.start_with?("Route not found")
+        if method == "DELETE" && after_network && status == 404 && j.is_a?(Hash) && api_code(j) != "route_not_found"
           # lo borró el intento que se quedó sin respuesta
-          return { "status" => "success", "status_code" => "0", "message" => "Already deleted",
-                   "data" => { "state" => "deleted", "changed" => false } }
+          return { "status" => "success", "message" => "Already deleted", "data" => { "state" => "deleted", "changed" => false } }
         end
         if j.is_a?(Hash)
           message = j["message"].is_a?(String) ? j["message"] : "Error"
-          raise Error.new(message, http: status, status_code: text(j["status_code"]), detail: text(j["detail"]), data: j["data"],
+          raise Error.new(message, http: status, code: api_code(j), detail: text(j["detail"]), data: j["data"],
                                    response: j, request_id: rid)
         end
         raise Error.new("HTTP #{status}", http: status, request_id: rid)
@@ -352,24 +352,29 @@ module MundoSMS
     end
 
     # Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un
-    # fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 «Request in progress». Un 5xx de un POST
-    # no: la API no guarda los 5xx y repetirlo lo haría otra vez. Un 409 «Duplicated request» (la MISMA petición firmada llegó
+    # fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST
+    # no: un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo
+    # nada, pero repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó
     # dos veces: la repitió algo entre medias) es un fallo de red más.
     def retryable?(method, network, status, j, idem_key)
       return true if status == 429
 
-      message = j.is_a?(Hash) && j["message"].is_a?(String) ? j["message"] : nil
       network ||= duplicated?(status, j)
       return network || status >= 500 if method == "GET"
       return network if %w[PATCH DELETE].include?(method)
-      return network || (status == 409 && message == "Request in progress") if idem_key
+      return network || (status == 409 && api_code(j) == "request_in_progress") if idem_key
 
       false
     end
 
-    # 409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias).
+    # 409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias).
     def duplicated?(status, j)
-      status == 409 && j.is_a?(Hash) && j["message"].is_a?(String) && j["message"].start_with?("Duplicated request")
+      status == 409 && api_code(j) == "duplicated_request"
+    end
+
+    # El code de una respuesta de error ("duplicated_request"…) como texto, o nil si no lo trae.
+    def api_code(j)
+      j.is_a?(Hash) ? text(j["code"]) : nil
     end
 
     # El cupo de la respuesta (X-RateLimit-Limit, -Remaining y -Reset, en enteros), o nil si no lo trae.

@@ -14,7 +14,7 @@ const { MundoSMS, MundoSMSError } = require(sdk); // en el repositorio, o con to
 
 const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI0MiIsInN1YiI6IjcifQ.cHJ1ZWJh";
 const KEY = "Pr4ebaClaveDe20Letra";
-const OK = { status: "success", status_code: "0", message: "OK", data: { id: 8812345 } };
+const OK = { status: "success", message: "OK", data: { id: 8812345 } };
 
 /** La firma de «La firma» de la documentación: base64url, sin relleno, del HMAC-SHA256. */
 function firma(clave, token, ts, metodo, ruta, cuerpo = Buffer.alloc(0)) {
@@ -77,12 +77,41 @@ test("un aviso: el ejemplo de whsec_ejemplo", () => {
 });
 
 test("reintentos: un 429 sí; un POST con 5xx, no", async (t) => {
-  const s = await servidor(t, (n) => (n < 3 ? [429, { "Retry-After": "0" }, { status: "error", message: "Too many requests" }] : [200, {}, OK]));
+  const s = await servidor(t, (n) => (n < 3 ? [429, { "Retry-After": "0" }, { status: "error", code: "requests_per_second", message: "Too many requests" }] : [200, {}, OK]));
   assert.strictEqual((await cliente(s).get("/calls")).status, "success");
   assert.strictEqual(new Set(s.peticiones.map((x) => x.cabeceras["x-timestamp"])).size, 3);
-  const s2 = await servidor(t, () => [500, {}, { status: "error", status_code: "2", message: "Internal error" }]);
+  const s2 = await servidor(t, () => [500, {}, { status: "error", code: "internal_error", message: "Internal error" }]);
   const e = await falla(() => cliente(s2).post("/sms", { to: "1" }));
-  assert.deepStrictEqual([e.http, s2.peticiones.length], [500, 1]);
+  assert.deepStrictEqual([e.http, e.code, s2.peticiones.length], [500, "internal_error", 1]);
+});
+
+// un 409 se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con su
+// clave) se repiten; otro 409, aunque su message diga lo mismo, no
+test("un 409: por su code", async (t) => {
+  for (const [metodo, code, mensaje, n] of [["GET", "duplicated_request", "Duplicated request", 3], ["PATCH", "duplicated_request", "Duplicated request", 3],
+    ["POST", "duplicated_request", "Duplicated request", 3], ["POST", "request_in_progress", "Request in progress", 3],
+    ["PATCH", "request_in_progress", "Request in progress", 1], ["POST", "already_exists", "Request in progress", 1]]) {
+    const s = await servidor(t, () => [409, { "Retry-After": "0" }, { status: "error", code, message: mensaje }]);
+    const e = await falla(() => cliente(s, { retries: 2 }).request(metodo, "/x", { a: 1 }));
+    assert.deepStrictEqual([e.http, e.code, s.peticiones.length], [409, code, n], metodo + " " + code);
+  }
+});
+
+test("los campos del error", async (t) => {
+  const r = [[404, { "X-Request-Id": "req-1" }, { status: "error", code: "not_found", message: "Call not found", detail: "no call 999" }],
+             [200, {}, { status: "error", code: "whatsapp_rejected", message: "WhatsApp rejected it", data: { id: "wam-1" } }],
+             [502, { "Content-Type": "text/html" }, "<html>Bad gateway</html>"],
+             [202, {}, { status: "success", message: "Not confirmed", data: { id: "wam-2", state: "unknown" } }]];
+  const s = await servidor(t, (n) => r[n - 1]);
+  const api = cliente(s, { retries: 0 });
+  let e = await falla(() => api.get("/calls/out/999"));
+  assert.deepStrictEqual([e.http, e.code, e.message, e.detail, e.requestId, e.response.status], [404, "not_found", "Call not found", "no call 999", "req-1", "error"]);
+  assert.ok(!("statusCode" in e));
+  e = await falla(() => api.post("/whatsapp/messages", { to: "1" }));
+  assert.deepStrictEqual([e.http, e.code, e.data], [200, "whatsapp_rejected", { id: "wam-1" }]);
+  e = await falla(() => api.get("/calls"));
+  assert.deepStrictEqual([e.http, e.code, e.message, e.response], [502, null, "HTTP 502", null]);
+  assert.strictEqual((await api.post("/whatsapp/messages", { to: "1" })).data.state, "unknown"); // el 202 no es un error
 });
 
 test("el plazo es de la petición entera", async (t) => {
@@ -143,10 +172,14 @@ test("un «+» en la query de la ruta llega como «+»", async (t) => {
 });
 
 test("un DELETE que se hizo y perdió la respuesta", async (t) => {
-  const no = { status: "error", status_code: "4", message: "Speed dial not found" };
+  const no = { status: "error", code: "not_found", message: "Speed dial not found" };
   const s = await servidor(t, (n) => (n === 1 ? "corta" : [404, {}, no]));
   const r = await cliente(s, { retries: 1 }).delete("/speed-dials/9121");
-  assert.deepStrictEqual([r.status, r.message, r.data.changed, s.peticiones.length], ["success", "Already deleted", false, 2]);
+  assert.deepStrictEqual([r, s.peticiones.length], [{ status: "success", message: "Already deleted", data: { state: "deleted", changed: false } }, 2]);
+  const ruta = { status: "error", code: "route_not_found", message: "Route not found" }; // tras el corte, una ruta que no existe es un error
+  const s3 = await servidor(t, (n) => (n === 1 ? "corta" : [404, {}, ruta]));
+  const e = await falla(() => cliente(s3, { retries: 1 }).delete("/speed-dials/9121"));
+  assert.deepStrictEqual([e.http, e.code], [404, "route_not_found"]);
   const s2 = await servidor(t, () => [404, {}, no]); // sin fallo de red antes, un 404 es un error
   assert.strictEqual((await falla(() => cliente(s2, { retries: 1 }).delete("/speed-dials/9121"))).http, 404);
 });
@@ -154,7 +187,7 @@ test("un DELETE que se hizo y perdió la respuesta", async (t) => {
 test("lastCursor es el del recorrido", async (t) => {
   const s = await servidor(t, (n, p) => (p.ruta.startsWith("/v3/vacia") ? [200, {}, { status: "success", data: { results: 0, calls: [], has_more: false, next_cursor: null } }]
     : p.ruta.startsWith("/v3/una") ? [200, {}, { status: "success", data: { results: 1, calls: [{ id: 1 }], has_more: false, next_cursor: "u1" } }]
-      : [400, {}, { status: "error", status_code: "3", message: "Parameter cursor not valid" }]));
+      : [400, {}, { status: "error", code: "invalid_parameter", message: "Parameter cursor not valid" }]));
   const api = cliente(s, { retries: 0 });
   for await (const x of api.all("/vacia", { cursor: "c9" })) void x;
   assert.strictEqual(api.lastCursor, "c9");

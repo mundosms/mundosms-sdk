@@ -13,7 +13,7 @@ firma de los avisos que te mandamos ([Comprobar los avisos](#comprobar-los-aviso
 | Node.js | [`node/mundosms.js`](node/mundosms.js) (y [`node/mundosms.d.ts`](node/mundosms.d.ts), los tipos de TypeScript) | Node.js 18 o superior |
 | Java | [`java/MundoSMS.java`](java/MundoSMS.java) (el paquete `es.mundosms:mundosms-sdk` de Maven Central) | Java 8 o superior |
 | C# (.NET) | [`dotnet/MundoSMS.cs`](dotnet/MundoSMS.cs) | .NET Framework 4.6.1 o superior, o .NET 5 o superior (C# 6 o superior) |
-| Go | [`go/mundosms.go`](go/mundosms.go) (el módulo `github.com/mundosms/mundosms-sdk/go`) | Go 1.22 o superior |
+| Go | [`go/mundosms.go`](go/mundosms.go) (el módulo `github.com/mundosms/mundosms-sdk/go/v2`) | Go 1.22 o superior |
 | Ruby | [`ruby/lib/mundosms.rb`](ruby/lib/mundosms.rb) (la gema `mundosms`) | Ruby 3.1 o superior |
 
 Las API Keys (token y clave privada) se crean en el panel de MundoSMS, en **API y Soporte → Claves de API**.
@@ -37,7 +37,7 @@ foreach ($api->all("/calls", ["from_datetime" => "2026-11-01"]) as $call) {
 try {
     $api->patch("/extensions/recepcion", ["record_calls" => true]);
 } catch (MundoSMSError $e) {
-    echo $e->http, " ", $e->statusCode, " ", $e->getMessage(), " ", $e->detail, " ", $e->requestId, "\n";
+    echo $e->http, " ", $e->code, " ", $e->getMessage(), " ", $e->detail, " ", $e->requestId, "\n";
 }
 ```
 
@@ -56,7 +56,7 @@ for call in api.all("/calls", {"from_datetime": "2026-11-01"}):
 try:
     api.patch("/extensions/recepcion", {"record_calls": True})
 except MundoSMSError as e:
-    print(e.http, e.status_code, e.message, e.detail, e.request_id)
+    print(e.http, e.code, e.message, e.detail, e.request_id)
 ```
 
 ## Node.js
@@ -80,7 +80,7 @@ async function main() {
     await api.patch("/extensions/recepcion", { record_calls: true });
   } catch (e) {
     if (!(e instanceof MundoSMSError)) throw e;
-    console.log(e.http, e.statusCode, e.message, e.detail, e.requestId);
+    console.log(e.http, e.code, e.message, e.detail, e.requestId);
   }
 }
 
@@ -123,11 +123,11 @@ Está en Maven Central, `es.mundosms:mundosms-sdk`, sin dependencias. Funciona d
 <dependency>
   <groupId>es.mundosms</groupId>
   <artifactId>mundosms-sdk</artifactId>
-  <version>1.2.0</version>
+  <version>2.0.0</version>
 </dependency>
 ```
 
-(con Gradle, `implementation("es.mundosms:mundosms-sdk:1.2.0")` en `dependencies`). También puedes copiar el fichero:
+(con Gradle, `implementation("es.mundosms:mundosms-sdk:2.0.0")` en `dependencies`). También puedes copiar el fichero:
 `MundoSMS.java` es del paquete `es.mundosms` y va en la carpeta `es/mundosms/` de tus fuentes (con Maven o Gradle,
 `src/main/java/es/mundosms/MundoSMS.java`).
 
@@ -150,7 +150,7 @@ public class Example {
         try {
             api.patch("/extensions/recepcion", MundoSMS.map("record_calls", true));
         } catch (MundoSMSError e) {
-            System.out.println(e.getHttp() + " " + e.getStatusCode() + " " + e.getMessage() + " " + e.getDetail() + " " + e.getRequestId());
+            System.out.println(e.getHttp() + " " + e.getCode() + " " + e.getMessage() + " " + e.getDetail() + " " + e.getRequestId());
         }
     }
 }
@@ -194,7 +194,7 @@ class Program
         }
         catch (MundoSMSException e)
         {
-            Console.WriteLine($"{e.Http} {e.StatusCode} {e.Message} {e.Detail} {e.RequestId}");
+            Console.WriteLine($"{e.Http} {e.Code} {e.Message} {e.Detail} {e.RequestId}");
         }
     }
 }
@@ -224,11 +224,11 @@ class Program
 
 ## Go
 
-Un módulo, `github.com/mundosms/mundosms-sdk/go`, con un solo fichero y sin dependencias (solo la biblioteca estándar).
+Un módulo, `github.com/mundosms/mundosms-sdk/go/v2`, con un solo fichero y sin dependencias (solo la biblioteca estándar).
 Funciona desde Go 1.22; recorrer `All` con `for … range` pide Go 1.23 o superior. En tu módulo:
 
 ```sh
-go get github.com/mundosms/mundosms-sdk/go
+go get github.com/mundosms/mundosms-sdk/go/v2
 ```
 
 ```go
@@ -240,7 +240,7 @@ import (
 	"fmt"
 	"log"
 
-	mundosms "github.com/mundosms/mundosms-sdk/go"
+	mundosms "github.com/mundosms/mundosms-sdk/go/v2"
 )
 
 func main() {
@@ -265,7 +265,7 @@ func main() {
 	_, err = api.Patch(ctx, "/extensions/recepcion", mundosms.Params{"record_calls": true})
 	var e *mundosms.Error
 	if errors.As(err, &e) {
-		fmt.Println(e.HTTP, e.StatusCode, e.Message, e.Detail, e.RequestID)
+		fmt.Println(e.HTTP, e.Code, e.Message, e.Detail, e.RequestID)
 	}
 }
 ```
@@ -287,7 +287,9 @@ func main() {
   un tipo que no va en la query) da un error que envuelve a `mundosms.ErrInvalidArgument`, y no se manda nada.
 - Crea un cliente y reutilízalo: se puede usar desde varias goroutines a la vez.
 - `fmt.Print` del cliente (`%v`, `%+v`, `%#v`) enseña solo la dirección de la API: ni el token ni la clave privada.
-- La documentación del paquete está en [pkg.go.dev](https://pkg.go.dev/github.com/mundosms/mundosms-sdk/go).
+- La documentación del paquete está en [pkg.go.dev](https://pkg.go.dev/github.com/mundosms/mundosms-sdk/go/v2).
+- Desde la 2.0.0 la ruta del módulo termina en `/v2`, como pide Go a partir de la versión 2: con la 1.x era
+  `github.com/mundosms/mundosms-sdk/go`. Al actualizar, cambia la ruta en el `go get` y en el `import`.
 
 ## Ruby
 
@@ -313,7 +315,7 @@ end
 begin
   api.patch("/extensions/recepcion", { "record_calls" => true })
 rescue MundoSMS::Error => e
-  puts [e.http, e.status_code, e.message, e.detail, e.request_id].join(" ")
+  puts [e.http, e.code, e.message, e.detail, e.request_id].join(" ")
 end
 ```
 
@@ -331,7 +333,7 @@ end
 ## Qué hace cada método
 
 - `get(path, query)`, `post(path, data)`, `patch(path, data)` y `delete(path, query)` devuelven la respuesta entera
-  (`status`, `status_code`, `message`, `data`). `post` admite un tercer argumento con tu `Idempotency-Key`
+  (`status`, `message`, `data`). `post` admite un tercer argumento con tu `Idempotency-Key`
   ([Reintentos](#reintentos-e-idempotency-key)), igual que `request(method, path, data, options)`.
   - **La ruta** va sin `/v3` (`"/calls"`, `"/numbers/34910123456"`); si la escribes con `/v3` delante, se quita (cuando
     `baseUrl` ya lo lleva, como la de por defecto). Cada trozo se codifica solo (espacios, tildes, `+`…); un `%XX` que ya
@@ -378,13 +380,18 @@ lo reenvíes.
 | | PHP | Python | Node.js | Java | C# | Go | Ruby |
 |---|---|---|---|---|---|---|---|
 | código HTTP (`0` si no hubo respuesta) | `$e->http` | `e.http` | `e.http` | `e.getHttp()` | `e.Http` | `e.HTTP` | `e.http` |
-| `status_code` de la API (texto: `"3"`, `"4"`…) | `$e->statusCode` | `e.status_code` | `e.statusCode` | `e.getStatusCode()` | `e.StatusCode` | `e.StatusCode` | `e.status_code` |
+| `code` de la API (`"not_found"`, `"invalid_parameter"`…) | `$e->code` | `e.code` | `e.code` | `e.getCode()` | `e.Code` | `e.Code` | `e.code` |
 | mensaje | `$e->getMessage()` | `e.message` | `e.message` | `e.getMessage()` | `e.Message` | `e.Message` | `e.message` |
 | `detail` | `$e->detail` | `e.detail` | `e.detail` | `e.getDetail()` | `e.Detail` | `e.Detail` | `e.detail` |
 | `data` de la respuesta | `$e->data` | `e.data` | `e.data` | `e.getData()` | `e.Data` | `e.Data` | `e.data` |
 | la cabecera `X-Request-Id` | `$e->requestId` | `e.request_id` | `e.requestId` | `e.getRequestId()` | `e.RequestId` | `e.RequestID` | `e.request_id` |
 | la respuesta entera, decodificada | `$e->response` | `e.response` | `e.response` | `e.getResponse()` | `e.Response` | `e.Response` | `e.response` |
 
+- **Decide por `code`, nunca por el mensaje:** `code` es una palabra en inglés y en snake_case que no cambia
+  (`not_found`, `invalid_parameter`, `insufficient_credit`, `whatsapp_window_closed`…; la lista, en el [Catálogo de
+  errores](https://www.mundosms.es/api-v3#catalogo-de-errores)), y el `message` es para leerlo una persona. Cuando la
+  respuesta no lo trae (sin respuesta, una redirección o una respuesta que no es JSON), `code` es `null` (`None` en Python,
+  `nil` en Ruby y `""` en Go). Una respuesta buena no lleva `code`.
 - Guarda el `X-Request-Id` cuando algo falle: con él encuentras la petición en Logs API y, si nos escribes, la
   encontramos nosotros.
 - Sin respuesta (la red, o el plazo agotado), `http` es `0` y el mensaje empieza por `No response from the API:`, seguido
@@ -413,9 +420,11 @@ Qué se reintenta, hasta `retries` veces (3 por defecto):
 |---|---|---|---|
 | `429`: demasiadas peticiones (no se hizo nada) | sí | sí | sí |
 | sin respuesta: la red, o el plazo agotado | sí | sí | sí, con la misma `Idempotency-Key` |
-| `409 Duplicated request`: la misma petición firmada llegó dos veces (la repitió algo entre medias) | sí | sí | sí, con la misma clave |
-| `409 Request in progress`: la primera con esa clave aún no ha terminado | — | — | sí, con la misma clave |
-| `5xx` | sí | no | no: la API no guarda los `5xx`, y repetirlo lo haría otra vez |
+| `409` con `code` `duplicated_request`: la misma petición firmada llegó dos veces (la repitió algo entre medias) | sí | sí | sí, con la misma clave |
+| `409` con `code` `request_in_progress`: la primera con esa clave aún no ha terminado | — | — | sí, con la misma clave |
+| `500`: error de la API, puede haberse hecho | sí | no | no: la API guarda el `500` con la clave, y repetirlo con la misma te devolvería el mismo `500` |
+| `503`: no se hizo nada (trae `data.retry: true`) | sí | no | no, aunque se puede: repítelo tú en unos segundos, con la misma clave |
+| `502`, `504` u otro `5xx` que no es JSON: lo escribe el servidor web de delante | sí | no | no: trátalo como un `500`, puede haberse hecho |
 
 Antes de cada intento se espera lo que diga la cabecera `Retry-After` (como mucho 60 segundos); si no la trae, 1, 2, 4…
 segundos. Cada intento va firmado con su propio `X-Timestamp`, en milisegundos y siempre mayor que el de la petición
@@ -472,15 +481,28 @@ también en `Request`.
 `r.IdempotentReplayed`, y en Go, `r.IdempotentReplayed()`. Quiere decir que no se ha vuelto a hacer nada: el `id` es el de la primera vez. Si no se repitió,
 ese campo no va.
 
+- **Un `500` también se guarda,** porque puede llegar con la operación hecha (el SMS ya enviado, la extensión ya sonando).
+  Si repites el mismo `POST` con la misma clave en las 24 horas siguientes, te llega el mismo `500`, con la cabecera
+  `Idempotent-Replayed: true`, y no se vuelve a hacer. Te puede llegar así también en un reintento del propio SDK, si el
+  intento que se quedó sin respuesta acabó en un `500`. Sigue siendo un error, y su `response` (la respuesta entera, en
+  [Errores](#errores)) trae `"idempotent_replayed": true`. El error no tiene una propiedad propia para eso: el
+  `IdempotentReplayed` de C# y Go es de las respuestas buenas.
+- **Tras un `500`, comprueba si se hizo** antes de repetirlo, como dice
+  [Reintentos seguros](https://www.mundosms.es/api-v3#reintentos-seguros) (en un envío, búscalo por tu `client_id`). Si no se
+  hizo, repítelo con **otra** clave: con la misma, te llega el mismo `500` durante 24 horas. Un `503`, en cambio, no hizo
+  nada ni se guarda: repítelo con la misma.
 - La misma clave con otra petición (otra ruta u otro cuerpo) da `422 Idempotency-Key already used`: es un error, no se
   reintenta.
 - En `POST /v3/extensions` la API no guarda la respuesta, porque lleva la contraseña SIP. Si un reintento da
-  `409 Extension already exists`, la creó el intento anterior: su contraseña está en el panel, en **Líneas SIP**.
+  `409 Extension already exists`, puede ser la que creó el intento anterior o de otra cuenta: el nombre es único en toda la
+  plataforma. Míralo con `GET /v3/extensions/{extension}` (con una clave que pueda leer extensiones). Si la encuentra, es
+  tuya (la creó el intento anterior, si no la tenías ya), y su contraseña sale en `password` con una clave que pueda crear o
+  modificar extensiones; también está en el panel, en **Líneas SIP**. Si da `404`, el nombre es de otra cuenta: elige otro.
 - **Un `DELETE` que se quedó sin respuesta** se repite, y si la API contesta entonces `404`, es que el intento que se quedó
   sin respuesta ya lo borró: vuelve como éxito, `{"status": "success", "message": "Already deleted", "data": {"state":
   "deleted", "changed": false}}`, y no como error. Sin el fallo de red de antes, un `404` sigue siendo un error. Lo mismo si
   la petición la repitió el propio cliente HTTP con la misma firma, con «Rechazar peticiones repetidas» en la clave (así
-  nacen): la API contesta `409 Duplicated request` y el SDK la repite firmada de nuevo.
+  nacen): la API contesta `409` con `code` `duplicated_request` y el SDK la repite firmada de nuevo.
 
 ## Opciones
 
@@ -670,7 +692,7 @@ import (
 	"log"
 	"net/http"
 
-	mundosms "github.com/mundosms/mundosms-sdk/go"
+	mundosms "github.com/mundosms/mundosms-sdk/go/v2"
 )
 
 func main() {
@@ -707,9 +729,10 @@ La referencia completa de cada ruta, sus parámetros y sus respuestas está en
 
 ## Versiones
 
-Cada versión lleva su etiqueta (`v1.2.0`…) y sus cambios en [CHANGELOG.md](CHANGELOG.md). Para no llevarte cambios sin
-querer, descarga el fichero de una versión concreta. El módulo de Go lleva además su etiqueta, `go/v1.2.0`…, con la misma
-versión: `go get github.com/mundosms/mundosms-sdk/go@v1.2.0`.
+Cada versión lleva su etiqueta (`v2.0.0`…) y sus cambios en [CHANGELOG.md](CHANGELOG.md). Para no llevarte cambios sin
+querer, descarga el fichero de una versión concreta. El módulo de Go lleva además su etiqueta, `go/v2.0.0`…, con la misma
+versión: `go get github.com/mundosms/mundosms-sdk/go/v2@v2.0.0` (hasta la 1.2.0, sin `/v2`:
+`go get github.com/mundosms/mundosms-sdk/go@v1.2.0`).
 
 Con Composer (`composer require mundosms/sdk`) solo se instala lo de PHP (`php/`, `composer.json`, este README, la licencia
 y los cambios). El zip del código de cada versión en GitHub («Source code») también lleva solo eso; con todos los clientes,

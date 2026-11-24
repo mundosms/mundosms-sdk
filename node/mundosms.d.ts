@@ -21,7 +21,7 @@ export interface MundoSMSOptions {
   baseUrl?: string;
   /**
    * Cuántas veces se reintenta lo que es seguro repetir (0, ninguna): un 429 y un fallo de red en cualquier método, un 5xx en
-   * GET y, en POST, un 409 «Request in progress». Por defecto, 3.
+   * GET y, en POST, un 409 request_in_progress. Por defecto, 3.
    */
   retries?: number;
   /** Los segundos que puede durar cada petición entera (conectar, mandar y recibir la respuesta). Admite decimales. Por defecto, 60. */
@@ -57,8 +57,6 @@ export interface RequestOptions {
  */
 export interface MundoSMSResponse<T = any> {
   status: "success";
-  /** "0" si fue bien. Es texto, no un número. */
-  status_code: string;
   /** "OK", "N results" en los listados… */
   message: string;
   detail?: string | null;
@@ -91,7 +89,8 @@ export type Result<T> = 0 extends 1 & T ? MundoSMSResponse<any> : [T] extends [F
 /** La respuesta de error, tal como la mandó la API (en `MundoSMSError.response`). */
 export interface ErrorResponse {
   status?: string;
-  status_code?: string;
+  /** La palabra que dice qué falló, en inglés y snake_case: "not_found", "invalid_parameter", "duplicated_request"… */
+  code?: string;
   message?: string;
   detail?: string | null;
   data?: any;
@@ -119,7 +118,7 @@ export declare class MundoSMSError extends Error {
   constructor(
     message: string,
     http?: number,
-    statusCode?: string | null,
+    code?: string | null,
     detail?: string | null,
     response?: ErrorResponse | null,
     data?: any,
@@ -128,8 +127,11 @@ export declare class MundoSMSError extends Error {
   name: "MundoSMSError";
   /** El código HTTP; 0 si no hubo respuesta. */
   http: number;
-  /** El `status_code` de la API, como texto ("3", "4", "12"…); `null` si la respuesta no era JSON. */
-  statusCode: string | null;
+  /**
+   * El `code` de la API: la palabra que dice qué falló, en inglés y snake_case ("not_found", "invalid_parameter",
+   * "insufficient_credit"…). `null` si la respuesta no lo trae (sin respuesta, una redirección o una respuesta que no es JSON).
+   */
+  code: string | null;
   /** El `detail` de la respuesta, si lo trae. */
   detail: string | null;
   /** La respuesta entera, decodificada; `null` si no era JSON. */
@@ -166,7 +168,7 @@ export declare class MundoSMS {
   get<T = any>(path: string, query?: QueryParams | null): Promise<Result<T>>;
   /**
    * POST: `data` va en un cuerpo JSON. Lleva una `Idempotency-Key` (la de `options` o un UUID nuevo), la misma en todos sus
-   * intentos: por eso se repite sin miedo ante un fallo de red o un 409 «Request in progress».
+   * intentos: por eso se repite sin miedo ante un fallo de red o un 409 request_in_progress.
    */
   post<T = any>(path: string, data?: RequestBody | null, options?: RequestOptions | null): Promise<Result<T>>;
   /** PATCH: `data` va en un cuerpo JSON. */

@@ -7,7 +7,7 @@
       netstandard2.0  el resto (.NET Core 2.x, Mono, Xamarin, Unity…).
       net6.0          .NET 6 y 7: añade AllAsync (IAsyncEnumerable).
       net8.0          .NET 8 o superior (con soporte): lo mismo que net6.0, compilado para el que se usa hoy.
-    Sin dependencias. Para empaquetar: dotnet pack -c Release (deja MundoSMS.1.2.0.nupkg en bin/Release). Un aviso del
+    Sin dependencias. Para empaquetar: dotnet pack -c Release (deja MundoSMS.2.0.0.nupkg en bin/Release). Un aviso del
     compilador es un error (TreatWarningsAsErrors): el paquete se construye limpio o no se construye.
   -->
 
@@ -25,7 +25,7 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
 
     <PackageId>MundoSMS</PackageId>
-    <Version>1.2.0</Version>
+    <Version>2.0.0</Version>
     <Authors>MundoSMS</Authors>
     <Company>MundoSMS</Company>
     <Product>MundoSMS</Product>

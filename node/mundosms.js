@@ -10,16 +10,17 @@
  *   console.log(r.data.id);
  *   for await (const call of api.all("/calls", { from_datetime: "2026-11-01", stop_at_ongoing: true })) { ... }
  *
- * Errores: excepción MundoSMSError con .http (código HTTP), .statusCode ("3", "4"…), .message, .detail, .data, .response (la
- * respuesta entera) y .requestId (la cabecera X-Request-Id). También cuando la API contesta con "status": "error", venga con
- * el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta, con data.state "unknown".
+ * Errores: excepción MundoSMSError con .http (código HTTP), .code (la palabra de la API: "not_found", "invalid_parameter"…),
+ * .message, .detail, .data, .response (la respuesta entera) y .requestId (la cabecera X-Request-Id). También cuando la API
+ * contesta con "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta, con data.state "unknown".
  * Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
- * api.post(path, data, { idempotencyKey: "pedido-881" })). Por eso un POST que falla por la red, o con 409 «Request in
- * progress», se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
+ * api.post(path, data, { idempotencyKey: "pedido-881" })). Por eso un POST que falla por la red, o con 409
+ * request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
  * idempotent_replayed: true.
  * Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
- * con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como mucho
- * 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
+ * con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
+ * repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
+ * diga Retry-After (como mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
  * como éxito, con data.changed false.
  * Una redirección (3xx) no se sigue nunca: es un MundoSMSError (la API no redirige, y seguirla llevaría tu firma y tus datos
  * a otro servidor). Un 2xx que no es JSON (el HTML de un proxy o de un portal cautivo) también es un error; los ficheros que
@@ -29,7 +30,7 @@
 "use strict";
 const crypto = require("crypto");
 
-const VERSION = "1.2.0";
+const VERSION = "2.0.0";
 const MAX_RETRY_WAIT = 60; // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
 const WEBHOOK_TOLERANCE = 300; // segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
 const CLIENT_OPTIONS = ["baseUrl", "retries", "timeout"];
@@ -39,11 +40,11 @@ const NOT_PAGINATED = "MundoSMS: all() cannot go through %s: it has more (has_mo
 let lastTimestamp = 0; // el X-Timestamp de la última petición de este proceso (milisegundos)
 
 class MundoSMSError extends Error {
-  constructor(message, http = 0, statusCode = null, detail = null, response = null, data = null, requestId = null) {
+  constructor(message, http = 0, code = null, detail = null, response = null, data = null, requestId = null) {
     super(message);
     this.name = "MundoSMSError";
     this.http = http;
-    this.statusCode = statusCode;
+    this.code = code;
     this.detail = detail;
     this.response = response;
     this.data = data;
@@ -120,7 +121,7 @@ class MundoSMS {
       const data = r.data && typeof r.data === "object" && !Array.isArray(r.data) ? r.data : {};
       const cursor = data.next_cursor;
       if (data.has_more && data.results && !cursor) {
-        throw new MundoSMSError(NOT_PAGINATED.replace("%s", path), 200, r.status_code ?? null, null, r, data, null);
+        throw new MundoSMSError(NOT_PAGINATED.replace("%s", path), 200, null, null, r, data, null);
       }
       if (listKey === null) listKey = Object.keys(data).find((k) => Array.isArray(data[k])) || null;
       for (const item of listKey ? data[listKey] || [] : []) yield item;
@@ -209,11 +210,11 @@ class MundoSMS {
         }
         if (j.status !== "error") return j;
       }
-      if (method === "DELETE" && afterNetwork && http === 404 && isJson && !String(j.message || "").startsWith("Route not found")) {
+      if (method === "DELETE" && afterNetwork && http === 404 && isJson && code(j) !== "route_not_found") {
         // lo borró el intento que se quedó sin respuesta
-        return { status: "success", status_code: "0", message: "Already deleted", data: { state: "deleted", changed: false } };
+        return { status: "success", message: "Already deleted", data: { state: "deleted", changed: false } };
       }
-      if (isJson) throw new MundoSMSError(j.message || "Error", http, j.status_code ?? null, j.detail ?? null, j, j.data ?? null, rid);
+      if (isJson) throw new MundoSMSError(j.message || "Error", http, code(j), j.detail ?? null, j, j.data ?? null, rid);
       throw new MundoSMSError("HTTP " + http, http, null, null, null, null, rid);
     }
   }
@@ -258,7 +259,7 @@ class MundoSMS {
 /**
  * El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso. Dos peticiones iguales
  * en el mismo milisegundo (dos a la vez con Promise.all, o un reintento inmediato) firmarían igual, y la API rechazaría la
- * segunda por repetida («409 Duplicated request»).
+ * segunda por repetida («409 duplicated_request»).
  */
 function timestamp() {
   lastTimestamp = Math.max(Date.now(), lastTimestamp + 1);
@@ -282,23 +283,29 @@ function idempotencyKey(options, method) {
 
 /**
  * Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un fallo
- * de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 «Request in progress». Un 5xx de un POST no: la API
- * no guarda los 5xx y repetirlo lo haría otra vez. Un 409 «Duplicated request» (la MISMA petición firmada llegó dos veces: la
+ * de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST no: un 500
+ * puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero
+ * repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó dos veces: la
  * repitió algo entre medias, como hace un cliente HTTP con una conexión que se cerró) es un fallo de red más.
  */
 function retryable(method, network, http, j, idemKey) {
   if (http === 429) return true;
-  const message = j !== null && typeof j.message === "string" ? j.message : null;
   network = network || duplicated(http, j);
   if (method === "GET") return network || http >= 500;
   if (method === "PATCH" || method === "DELETE") return network;
-  if (idemKey) return network || (http === 409 && message === "Request in progress");
+  if (idemKey) return network || (http === 409 && code(j) === "request_in_progress");
   return false;
 }
 
-/** 409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
+/** 409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
 function duplicated(http, j) {
-  return http === 409 && j !== null && typeof j.message === "string" && j.message.startsWith("Duplicated request");
+  return http === 409 && code(j) === "duplicated_request";
+}
+
+/** El code de una respuesta de error ("duplicated_request"…) como texto, o null si no lo trae. */
+function code(j) {
+  if (j === null || typeof j !== "object" || j.code === undefined || j.code === null) return null;
+  return typeof j.code === "string" ? j.code : JSON.stringify(j.code);
 }
 
 /** El error de una redirección, con adónde mandaba (las redirecciones no se siguen: la API no redirige). */

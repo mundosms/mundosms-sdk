@@ -8,7 +8,7 @@ require "mundosms"
 
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI0MiIsInN1YiI6IjcifQ.cHJ1ZWJh"
 KEY = "Pr4ebaClaveDe20Letra"
-OK_BODY = '{"status":"success","status_code":"0","message":"OK","data":{"id":8812345}}'
+OK_BODY = '{"status":"success","message":"OK","data":{"id":8812345}}'
 
 # Lo que llegó al servidor de prueba en una petición.
 Seen = Struct.new(:method, :raw_path, :headers, :body, :signature_ok)
@@ -181,7 +181,7 @@ class MundoSMSTest < Minitest::Test
 
   def test_idempotency_key
     s = server do |n, _|
-      n == 1 ? json(409, '{"status":"error","status_code":"3","message":"Request in progress"}', "Retry-After" => "0") : json(200, OK_BODY)
+      n == 1 ? json(409, '{"status":"error","code":"request_in_progress","message":"Request in progress"}', "Retry-After" => "0") : json(200, OK_BODY)
     end
     api = client(s)
     api.post("/sms", { "to" => "1" })
@@ -199,16 +199,21 @@ class MundoSMSTest < Minitest::Test
     refute_equal k, r[4].headers["idempotency-key"]
   end
 
+  # Un 409 se decide por su code, no por el message: otro 409 con el message de request_in_progress no se repite.
   def test_retries
-    [["GET", 500, "Internal error", 3], ["POST", 500, "Internal error", 1], ["PATCH", 503, "Unavailable", 1],
-     ["DELETE", 500, "Internal error", 1], ["POST", 429, "Too many requests", 3], ["PATCH", 429, "Too many requests", 3],
-     ["GET", 409, "Duplicated request", 3], ["PATCH", 409, "Duplicated request (the same signed request arrived twice)", 3],
-     ["POST", 409, "Duplicated request", 3], ["POST", 409, "Request in progress", 3], ["PATCH", 409, "Request in progress", 1],
-     ["GET", 404, "Call not found", 1], ["POST", 422, "Idempotency-Key already used", 1]].each do |method, status, message, want|
-      s = server { json(status, %({"status":"error","status_code":"3","message":"#{message}"}), "Retry-After" => "0") }
+    [["GET", 500, "internal_error", "Internal error", 3], ["POST", 500, "internal_error", "Internal error", 1],
+     ["PATCH", 503, "service_unavailable", "Unavailable", 1], ["DELETE", 500, "internal_error", "Internal error", 1],
+     ["POST", 429, "requests_per_second", "Too many requests", 3], ["PATCH", 429, "requests_per_second", "Too many requests", 3],
+     ["GET", 409, "duplicated_request", "Duplicated request", 3],
+     ["PATCH", 409, "duplicated_request", "Duplicated request (the same signed request arrived twice)", 3],
+     ["POST", 409, "duplicated_request", "Duplicated request", 3], ["POST", 409, "request_in_progress", "Request in progress", 3],
+     ["PATCH", 409, "request_in_progress", "Request in progress", 1], ["POST", 409, "already_exists", "Request in progress", 1],
+     ["GET", 404, "not_found", "Call not found", 1],
+     ["POST", 422, "idempotency_key_reused", "Idempotency-Key already used", 1]].each do |method, status, code, message, want|
+      s = server { json(status, %({"status":"error","code":"#{code}","message":"#{message}"}), "Retry-After" => "0") }
       e = assert_raises(MundoSMS::Error) { client(s, retries: 2).request(method, "/x", { "a" => 1 }) }
-      assert_equal [status, message], [e.http, e.message]
-      assert_equal want, s.requests.size, "#{method} #{status} «#{message}»"
+      assert_equal [status, code, message], [e.http, e.code, e.message]
+      assert_equal want, s.requests.size, "#{method} #{status} #{code}"
     end
   end
 
@@ -223,7 +228,7 @@ class MundoSMSTest < Minitest::Test
   end
 
   def test_retry_after_is_honored
-    s = server { |n, _| n == 1 ? json(429, '{"status":"error","status_code":"14","message":"Too many requests"}', "Retry-After" => "1") : json(200, OK_BODY) }
+    s = server { |n, _| n == 1 ? json(429, '{"status":"error","code":"requests_per_second","message":"Too many requests"}', "Retry-After" => "1") : json(200, OK_BODY) }
     t0 = Time.now
     client(s).post("/sms", { "to" => "1" })
     assert (Time.now - t0).between?(0.9, 5)
@@ -263,20 +268,21 @@ class MundoSMSTest < Minitest::Test
   def test_errors
     s = server do |n, _|
       case n
-      when 1 then json(404, '{"status":"error","status_code":"4","message":"Call not found","detail":"no call 999 of type out"}', "X-Request-Id" => "req-1")
-      when 2 then json(200, '{"status":"error","status_code":12,"message":"WhatsApp rejected it","data":{"id":"wam-1"}}')
+      when 1 then json(404, '{"status":"error","code":"not_found","message":"Call not found","detail":"no call 999 of type out"}', "X-Request-Id" => "req-1")
+      when 2 then json(200, '{"status":"error","code":"whatsapp_rejected","message":"WhatsApp rejected it","data":{"id":"wam-1"}}')
       when 3 then [502, { "Content-Type" => "text/html", "X-Request-Id" => "req-3" }, "<html>Bad gateway</html>"]
-      when 4 then json(202, '{"status":"success","status_code":"11","message":"Not confirmed","data":{"id":"wam-2","state":"unknown"}}')
-      else json(400, '{"status":"error","status_code":"3","message":"Parameter xml_plan not valid","detail":["line 1","line 2"]}')
+      when 4 then json(202, '{"status":"success","message":"Not confirmed","data":{"id":"wam-2","state":"unknown"}}')
+      else json(400, '{"status":"error","code":"invalid_parameter","message":"Parameter xml_plan not valid","detail":["line 1","line 2"]}')
       end
     end
     api = client(s, retries: 0)
     e = assert_raises(MundoSMS::Error) { api.get("/calls/out/999") }
-    assert_equal [404, "4", "Call not found", "no call 999 of type out", "req-1", "error"], [e.http, e.status_code, e.message, e.detail, e.request_id, e.response["status"]]
+    assert_equal [404, "not_found", "Call not found", "no call 999 of type out", "req-1", "error"], [e.http, e.code, e.message, e.detail, e.request_id, e.response["status"]]
+    refute_respond_to e, :status_code
     e = assert_raises(MundoSMS::Error) { api.post("/whatsapp/messages", { "to" => "1" }) }
-    assert_equal [200, "12", "wam-1"], [e.http, e.status_code, e.data["id"]]
+    assert_equal [200, "whatsapp_rejected", "wam-1"], [e.http, e.code, e.data["id"]]
     e = assert_raises(MundoSMS::Error) { api.get("/calls") }
-    assert_equal [502, "HTTP 502", nil, "req-3"], [e.http, e.message, e.response, e.request_id]
+    assert_equal [502, nil, "HTTP 502", nil, "req-3"], [e.http, e.code, e.message, e.response, e.request_id]
     assert_equal "unknown", api.post("/whatsapp/messages", { "to" => "1" })["data"]["state"]
     e = assert_raises(MundoSMS::Error) { api.post("/campaigns", { "to" => "1" }) }
     assert_equal '["line 1","line 2"]', e.detail
@@ -351,7 +357,7 @@ class MundoSMSTest < Minitest::Test
       assert_equal [[], 1, nil], [got, s.requests.size, api.last_cursor]
     end
     pages = ['{"status":"success","data":{"results":1,"calls":[{"id":1}],"has_more":true,"next_cursor":"c1"}}',
-             '{"status":"error","status_code":"3","message":"Parameter cursor not valid"}']
+             '{"status":"error","code":"invalid_parameter","message":"Parameter cursor not valid"}']
     s = server { |n, _| json(n == 1 ? 200 : 400, pages[n - 1]) }
     api = client(s, retries: 0)
     got = []
@@ -392,17 +398,17 @@ class MundoSMSTest < Minitest::Test
   end
 
   # Un DELETE que se hizo y perdió la respuesta: el SDK lo repite y la API da 404. Ya estaba hecho: vuelve como éxito. Sin
-  # fallo de red antes, un 404 es un error; y «Route not found», también tras el fallo. Net::HTTP no lo repite por su cuenta.
+  # fallo de red antes, un 404 es un error; y route_not_found, también tras el fallo. Net::HTTP no lo repite por su cuenta.
   def test_delete_retried_after_network_error
-    [[true, "Speed dial not found", true], [false, "Speed dial not found", false], [true, "Route not found", false]].each do |cut, message, ok|
-      s = server { |n, _| cut && n == 1 ? :close : json(404, %({"status":"error","status_code":"4","message":"#{message}"})) }
+    [[true, "not_found", true], [false, "not_found", false], [true, "route_not_found", false]].each do |cut, code, ok|
+      s = server { |n, _| cut && n == 1 ? :close : json(404, %({"status":"error","code":"#{code}","message":"Not found"})) }
       api = client(s, retries: 1)
       if ok
         r = api.delete("/speed-dials/9121")
-        assert_equal ["success", "Already deleted", false], [r["status"], r["message"], r["data"]["changed"]]
+        assert_equal({ "status" => "success", "message" => "Already deleted", "data" => { "state" => "deleted", "changed" => false } }, r)
       else
         e = assert_raises(MundoSMS::Error) { api.delete("/speed-dials/9121") }
-        assert_equal [404, message], [e.http, e.message]
+        assert_equal [404, code], [e.http, e.code]
       end
       assert_equal cut ? 2 : 1, s.requests.size, "una petición por intento del SDK"
     end
@@ -415,7 +421,7 @@ class MundoSMSTest < Minitest::Test
       case x.raw_path
       when %r{\A/v3/vacia} then json(200, '{"status":"success","data":{"results":0,"calls":[],"has_more":false,"next_cursor":null}}')
       when %r{\A/v3/una} then json(200, '{"status":"success","data":{"results":1,"calls":[{"id":1}],"has_more":false,"next_cursor":"u1"}}')
-      else json(400, '{"status":"error","status_code":"3","message":"Parameter cursor not valid"}')
+      else json(400, '{"status":"error","code":"invalid_parameter","message":"Parameter cursor not valid"}')
       end
     end
     api = client(s, retries: 0)

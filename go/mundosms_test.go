@@ -78,7 +78,7 @@ func jsonReply(w http.ResponseWriter, status int, body string) {
 	io.WriteString(w, body)
 }
 
-const okBody = `{"status":"success","status_code":"0","message":"OK","data":{"id":8812345}}`
+const okBody = `{"status":"success","message":"OK","data":{"id":8812345}}`
 
 func client(t *testing.T, s *testServer, opts ...Option) *Client {
 	t.Helper()
@@ -251,7 +251,7 @@ func TestIdempotencyKey(t *testing.T) {
 	s := newServer(t, func(n int, _ *http.Request, w http.ResponseWriter) {
 		if n == 1 {
 			w.Header().Set("Retry-After", "0")
-			jsonReply(w, 409, `{"status":"error","status_code":"3","message":"Request in progress"}`)
+			jsonReply(w, 409, `{"status":"error","code":"request_in_progress","message":"Request in progress"}`)
 			return
 		}
 		jsonReply(w, 200, okBody)
@@ -271,7 +271,7 @@ func TestIdempotencyKey(t *testing.T) {
 		t.Errorf("la clave automática es un UUID v4: %q", k)
 	}
 	if r[1].Header.Get("Idempotency-Key") != k || r[1].Header.Get("X-Timestamp") <= r[0].Header.Get("X-Timestamp") || r[1].Header.Get("X-Signature") == r[0].Header.Get("X-Signature") {
-		t.Errorf("el reintento del 409 «Request in progress» (inmediato: Retry-After 0) lleva la MISMA clave y otro X-Timestamp, y se firma otra vez")
+		t.Errorf("el reintento del 409 request_in_progress (inmediato: Retry-After 0) lleva la MISMA clave y otro X-Timestamp, y se firma otra vez")
 	}
 	if r[2].Header.Get("Idempotency-Key") != "pedido-881" || r[3].Header.Get("Idempotency-Key") != "" {
 		t.Errorf("la tuya, tal cual; y un GET, sin clave (%q, %q)", r[2].Header.Get("Idempotency-Key"), r[3].Header.Get("Idempotency-Key"))
@@ -284,40 +284,42 @@ func TestIdempotencyKey(t *testing.T) {
 	}
 }
 
-// retryCase: lo que contesta el servidor (siempre lo mismo) y cuántas peticiones tienen que llegar con Retries(2).
+// retryCase: lo que contesta el servidor (siempre lo mismo) y cuántas peticiones tienen que llegar con Retries(2). Un 409 se
+// decide por su code, no por el message: otro 409 con el message de request_in_progress no se repite.
 func TestRetries(t *testing.T) {
 	cases := []struct {
-		method, status, message string
-		want                    int
+		method, status, code, message string
+		want                          int
 	}{
-		{"GET", "500", "Internal error", 3},
-		{"POST", "500", "Internal error", 1},
-		{"PATCH", "503", "Unavailable", 1},
-		{"DELETE", "500", "Internal error", 1},
-		{"POST", "429", "Too many requests", 3},
-		{"PATCH", "429", "Too many requests", 3},
-		{"GET", "409", "Duplicated request", 3},
-		{"PATCH", "409", "Duplicated request (the same signed request arrived twice)", 3},
-		{"POST", "409", "Duplicated request", 3},
-		{"POST", "409", "Request in progress", 3},
-		{"PATCH", "409", "Request in progress", 1},
-		{"GET", "404", "Call not found", 1},
-		{"POST", "422", "Idempotency-Key already used", 1},
+		{"GET", "500", "internal_error", "Internal error", 3},
+		{"POST", "500", "internal_error", "Internal error", 1},
+		{"PATCH", "503", "service_unavailable", "Unavailable", 1},
+		{"DELETE", "500", "internal_error", "Internal error", 1},
+		{"POST", "429", "requests_per_second", "Too many requests", 3},
+		{"PATCH", "429", "requests_per_second", "Too many requests", 3},
+		{"GET", "409", "duplicated_request", "Duplicated request", 3},
+		{"PATCH", "409", "duplicated_request", "Duplicated request (the same signed request arrived twice)", 3},
+		{"POST", "409", "duplicated_request", "Duplicated request", 3},
+		{"POST", "409", "request_in_progress", "Request in progress", 3},
+		{"PATCH", "409", "request_in_progress", "Request in progress", 1},
+		{"POST", "409", "already_exists", "Request in progress", 1},
+		{"GET", "404", "not_found", "Call not found", 1},
+		{"POST", "422", "idempotency_key_reused", "Idempotency-Key already used", 1},
 	}
 	for _, tc := range cases {
 		s := newServer(t, func(_ int, _ *http.Request, w http.ResponseWriter) {
 			w.Header().Set("Retry-After", "0")
 			st, _ := strconv.Atoi(tc.status)
-			jsonReply(w, st, `{"status":"error","status_code":"3","message":"`+tc.message+`"}`)
+			jsonReply(w, st, `{"status":"error","code":"`+tc.code+`","message":"`+tc.message+`"}`)
 		})
 		c := client(t, s, Retries(2))
 		_, err := c.Request(context.Background(), tc.method, "/x", Params{"a": 1})
 		var e *Error
-		if !errors.As(err, &e) || strconv.Itoa(e.HTTP) != tc.status || e.Message != tc.message {
+		if !errors.As(err, &e) || strconv.Itoa(e.HTTP) != tc.status || e.Code != tc.code || e.Message != tc.message {
 			t.Errorf("%s %s: %v", tc.method, tc.status, err)
 		}
 		if n := len(s.requests()); n != tc.want {
-			t.Errorf("%s %s «%s»: %d peticiones, y tenían que ser %d", tc.method, tc.status, tc.message, n, tc.want)
+			t.Errorf("%s %s %s: %d peticiones, y tenían que ser %d", tc.method, tc.status, tc.code, n, tc.want)
 		}
 	}
 }
@@ -352,7 +354,7 @@ func TestRetryAfterIsHonored(t *testing.T) {
 	s := newServer(t, func(n int, _ *http.Request, w http.ResponseWriter) {
 		if n == 1 {
 			w.Header().Set("Retry-After", "1")
-			jsonReply(w, 429, `{"status":"error","status_code":"14","message":"Too many requests"}`)
+			jsonReply(w, 429, `{"status":"error","code":"requests_per_second","message":"Too many requests"}`)
 			return
 		}
 		jsonReply(w, 200, okBody)
@@ -430,7 +432,7 @@ func TestTimeoutWholeRequest(t *testing.T) {
 func TestContextCancelStopsRetries(t *testing.T) {
 	s := newServer(t, func(_ int, _ *http.Request, w http.ResponseWriter) {
 		w.Header().Set("Retry-After", "30")
-		jsonReply(w, 429, `{"status":"error","status_code":"14","message":"Too many requests"}`)
+		jsonReply(w, 429, `{"status":"error","code":"requests_per_second","message":"Too many requests"}`)
 	})
 	c := client(t, s)
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
@@ -456,36 +458,36 @@ func TestErrors(t *testing.T) {
 		w.Header().Set("X-Request-Id", "req-"+strconv.Itoa(n))
 		switch n {
 		case 1:
-			jsonReply(w, 404, `{"status":"error","status_code":"4","message":"Call not found","detail":"no call 999 of type out"}`)
+			jsonReply(w, 404, `{"status":"error","code":"not_found","message":"Call not found","detail":"no call 999 of type out"}`)
 		case 2:
-			jsonReply(w, 200, `{"status":"error","status_code":12,"message":"WhatsApp rejected it","data":{"id":"wam-1"}}`)
+			jsonReply(w, 200, `{"status":"error","code":"whatsapp_rejected","message":"WhatsApp rejected it","data":{"id":"wam-1"}}`)
 		case 3:
 			w.Header().Set("Content-Type", "text/html")
 			w.WriteHeader(502)
 			io.WriteString(w, "<html>Bad gateway</html>")
 		case 4:
-			jsonReply(w, 202, `{"status":"success","status_code":"11","message":"Not confirmed","data":{"id":"wam-2","state":"unknown"}}`)
+			jsonReply(w, 202, `{"status":"success","message":"Not confirmed","data":{"id":"wam-2","state":"unknown"}}`)
 		case 5:
-			jsonReply(w, 400, `{"status":"error","status_code":"3","message":"Parameter xml_plan not valid","detail":["line 1","line 2"]}`)
+			jsonReply(w, 400, `{"status":"error","code":"invalid_parameter","message":"Parameter xml_plan not valid","detail":["line 1","line 2"]}`)
 		}
 	})
 	c := client(t, s, Retries(0))
 	ctx := context.Background()
 	_, err := c.Get(ctx, "/calls/out/999", nil)
 	var e *Error
-	if !errors.As(err, &e) || e.HTTP != 404 || e.StatusCode != "4" || e.Message != "Call not found" || e.Detail != "no call 999 of type out" ||
+	if !errors.As(err, &e) || e.HTTP != 404 || e.Code != "not_found" || e.Message != "Call not found" || e.Detail != "no call 999 of type out" ||
 		e.RequestID != "req-1" || e.Response["status"] != "error" || e.Unwrap() != nil {
 		t.Errorf("404: %#v", e)
 	}
-	if err.Error() != "mundosms: Call not found: no call 999 of type out (HTTP 404, status_code 4)" {
+	if err.Error() != "mundosms: Call not found: no call 999 of type out (HTTP 404, code not_found)" {
 		t.Errorf("Error(): %q", err.Error())
 	}
 	_, err = c.Post(ctx, "/whatsapp/messages", Params{"to": "1"})
-	if !errors.As(err, &e) || e.HTTP != 200 || e.StatusCode != "12" || e.Data["id"] != "wam-1" {
+	if !errors.As(err, &e) || e.HTTP != 200 || e.Code != "whatsapp_rejected" || e.Data["id"] != "wam-1" {
 		t.Errorf("un 200 con status error es un error: %v", err)
 	}
 	_, err = c.Get(ctx, "/calls", nil)
-	if !errors.As(err, &e) || e.HTTP != 502 || e.Message != "HTTP 502" || e.Response != nil || e.RequestID != "req-3" {
+	if !errors.As(err, &e) || e.HTTP != 502 || e.Code != "" || e.Message != "HTTP 502" || e.Response != nil || e.RequestID != "req-3" {
 		t.Errorf("502 sin JSON: %v", err)
 	}
 	r, err := c.Post(ctx, "/whatsapp/messages", Params{"to": "1"})
@@ -604,7 +606,7 @@ func TestAllStopsAndErrors(t *testing.T) {
 		{[]string{`{"status":"success","data":{"results":1,"calls":[{"id":1}],"has_more":true,"next_cursor":null}}`}, "", true, 1, ""},
 		{[]string{`{"status":"success","data":{"results":2,"calls":[{"id":1},{"id":2}],"has_more":true}}`}, "", true, 1, ""},
 		{[]string{`{"status":"success","data":{"results":1,"calls":[{"id":1}],"has_more":true,"next_cursor":"c1"}}`,
-			`{"status":"error","status_code":"3","message":"Parameter cursor not valid"}`}, "1", true, 2, "c1"},
+			`{"status":"error","code":"invalid_parameter","message":"Parameter cursor not valid"}`}, "1", true, 2, "c1"},
 		{[]string{`{"status":"success","data":{"results":1,"calls":["no"],"has_more":false}}`}, "", true, 1, ""},
 	}
 	for i, tc := range cases {
@@ -729,18 +731,18 @@ func TestNonJSONSuccessIsAnError(t *testing.T) {
 }
 
 // Un DELETE que se hizo y perdió la respuesta: el SDK lo repite y la API da 404. Ya estaba hecho: vuelve como éxito. Sin fallo
-// de red antes, un 404 es un error; y «Route not found», también tras el fallo.
+// de red antes, un 404 es un error; y route_not_found, también tras el fallo.
 func TestDeleteRetriedAfterNetworkError(t *testing.T) {
 	for _, tc := range []struct {
-		cut     bool
-		message string
-		wantOK  bool
-	}{{true, "Speed dial not found", true}, {false, "Speed dial not found", false}, {true, "Route not found", false}} {
+		cut    bool
+		code   string
+		wantOK bool
+	}{{true, "not_found", true}, {false, "not_found", false}, {true, "route_not_found", false}} {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		go func(cut bool, message string) {
+		go func(cut bool, code string) {
 			for n := 1; ; n++ {
 				conn, err := ln.Accept()
 				if err != nil {
@@ -748,21 +750,23 @@ func TestDeleteRetriedAfterNetworkError(t *testing.T) {
 				}
 				if req, err := http.ReadRequest(bufio.NewReader(conn)); err == nil && !(cut && n == 1) {
 					io.ReadAll(req.Body)
-					b := `{"status":"error","status_code":"4","message":"` + message + `"}`
+					b := `{"status":"error","code":"` + code + `","message":"Not found"}`
 					fmt.Fprintf(conn, "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(b), b)
 				}
 				conn.Close()
 			}
-		}(tc.cut, tc.message)
+		}(tc.cut, tc.code)
 		c, _ := New(testToken, testKey, BaseURL("http://"+ln.Addr().String()+"/v3"), Retries(1))
 		r, err := c.Delete(context.Background(), "/speed-dials/9121", nil)
 		ln.Close()
-		if tc.wantOK && (err != nil || r["status"] != "success" || r["message"] != "Already deleted" || r.Data()["changed"] != false) {
+		_, sc := r["status_code"]
+		_, co := r["code"]
+		if tc.wantOK && (err != nil || r["status"] != "success" || r["message"] != "Already deleted" || r.Data()["changed"] != false || sc || co) {
 			t.Errorf("tras el corte, el 404 del reintento: %v %v", r, err)
 		}
 		var e *Error
-		if !tc.wantOK && (!errors.As(err, &e) || e.HTTP != 404 || e.Message != tc.message) {
-			t.Errorf("corte %v, %q: tenía que ser un error 404: %v %v", tc.cut, tc.message, r, err)
+		if !tc.wantOK && (!errors.As(err, &e) || e.HTTP != 404 || e.Code != tc.code) {
+			t.Errorf("corte %v, %q: tenía que ser un error 404: %v %v", tc.cut, tc.code, r, err)
 		}
 	}
 }
@@ -777,7 +781,7 @@ func TestLastCursorPerTraversal(t *testing.T) {
 		case "/v3/una":
 			jsonReply(w, 200, `{"status":"success","data":{"results":1,"calls":[{"id":1}],"has_more":false,"next_cursor":"u1"}}`)
 		default:
-			jsonReply(w, 400, `{"status":"error","status_code":"3","message":"Parameter cursor not valid"}`)
+			jsonReply(w, 400, `{"status":"error","code":"invalid_parameter","message":"Parameter cursor not valid"}`)
 		}
 	})
 	c := client(t, s, Retries(0))

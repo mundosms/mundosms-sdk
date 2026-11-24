@@ -41,7 +41,7 @@ public class Respuesta
 
 /// <summary>
 /// Apunta cada petición (con su firma comprobada) y contesta con responde(n, petición). La misma petición firmada que llega dos
-/// veces (el mismo X-Timestamp: la repite el propio HttpClient con una conexión que se cerró) da 409 «Duplicated request», como
+/// veces (el mismo X-Timestamp: la repite el propio HttpClient con una conexión que se cerró) da 409 duplicated_request, como
 /// la API con «Rechazar peticiones repetidas».
 /// </summary>
 public sealed class Servidor : IDisposable
@@ -102,7 +102,7 @@ public sealed class Servidor : IDisposable
                 {
                     Peticiones.Add(p);
                     r = vistas.Add(p.Ruta + " " + ts) ? responde(Peticiones.Count, p)
-                        : Respuesta.Json(409, "{\"status\":\"error\",\"status_code\":\"3\",\"message\":\"Duplicated request\"}");
+                        : Respuesta.Json(409, "{\"status\":\"error\",\"code\":\"duplicated_request\",\"message\":\"Duplicated request\"}");
                 }
                 if (r == null) return;   // corta sin contestar
                 var sb = new StringBuilder("HTTP/1.1 " + r.Estado + " X\r\n");
@@ -153,7 +153,7 @@ public static class Pruebas
 {
     public const string Token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI0MiIsInN1YiI6IjcifQ.cHJ1ZWJh";
     public const string Clave = "Pr4ebaClaveDe20Letra";
-    const string Ok = "{\"status\":\"success\",\"status_code\":\"0\",\"message\":\"OK\",\"data\":{\"id\":8812345}}";
+    const string Ok = "{\"status\":\"success\",\"message\":\"OK\",\"data\":{\"id\":8812345}}";
     static int fallos;
 
     static void Bien(bool c, string que)
@@ -210,12 +210,45 @@ public static class Pruebas
         Bien(!MundoSMSClient.VerifyWebhook("whsec_ejemplo", cab, cuerpo), "de hace más de 5 minutos, no");
 
         Console.WriteLine("== reintentos y plazo");
-        using (var s = new Servidor((n, p) => n < 3 ? Respuesta.Json(429, "{\"status\":\"error\",\"message\":\"Too many requests\"}").Con("Retry-After", "0") : Respuesta.Json(200, Ok)))
+        using (var s = new Servidor((n, p) => n < 3 ? Respuesta.Json(429, "{\"status\":\"error\",\"code\":\"requests_per_second\",\"message\":\"Too many requests\"}").Con("Retry-After", "0") : Respuesta.Json(200, Ok)))
             Bien((string)Cliente(s).Get("/calls")["status"] == "success" && s.Peticiones.Count == 3, "un 429 se repite");
-        using (var s = new Servidor((n, p) => Respuesta.Json(500, "{\"status\":\"error\",\"status_code\":\"2\",\"message\":\"Internal error\"}")))
+        using (var s = new Servidor((n, p) => Respuesta.Json(500, "{\"status\":\"error\",\"code\":\"internal_error\",\"message\":\"Internal error\"}")))
         {
             var e = Error(() => Cliente(s).Post("/sms", new { to = "1" }));
-            Bien(e != null && e.Http == 500 && s.Peticiones.Count == 1, "un POST con 5xx no se repite");
+            Bien(e != null && e.Http == 500 && e.Code == "internal_error" && s.Peticiones.Count == 1, "un POST con 5xx no se repite");
+        }
+        // un 409 se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con su
+        // clave) se repiten; otro 409, aunque su message diga lo mismo, no
+        string[][] casos409 = { new[] { "GET", "duplicated_request", "Duplicated request", "3" }, new[] { "PATCH", "duplicated_request", "Duplicated request", "3" },
+                                new[] { "POST", "duplicated_request", "Duplicated request", "3" }, new[] { "POST", "request_in_progress", "Request in progress", "3" },
+                                new[] { "PATCH", "request_in_progress", "Request in progress", "1" }, new[] { "POST", "already_exists", "Request in progress", "1" } };
+        foreach (var c in casos409)
+        {
+            string b = "{\"status\":\"error\",\"code\":\"" + c[1] + "\",\"message\":\"" + c[2] + "\"}";
+            using (var s = new Servidor((n, p) => Respuesta.Json(409, b).Con("Retry-After", "0")))
+            {
+                var e = Error(() => Cliente(s, 2).Request(c[0], "/x", new { a = 1 }));
+                Bien(e != null && e.Http == 409 && e.Code == c[1] && s.Peticiones.Count == int.Parse(c[3]), "409 " + c[1] + " en " + c[0] + ": " + c[3] + " petición(es)");
+            }
+        }
+
+        Console.WriteLine("== los campos del error");
+        Respuesta[] errs = { Respuesta.Json(404, "{\"status\":\"error\",\"code\":\"not_found\",\"message\":\"Call not found\",\"detail\":\"no call 999\"}").Con("X-Request-Id", "req-1"),
+                             Respuesta.Json(200, "{\"status\":\"error\",\"code\":\"whatsapp_rejected\",\"message\":\"WhatsApp rejected it\",\"data\":{\"id\":\"wam-1\"}}"),
+                             Respuesta.De(502, "text/html", "<html>Bad gateway</html>"),
+                             Respuesta.Json(202, "{\"status\":\"success\",\"message\":\"Not confirmed\",\"data\":{\"id\":\"wam-2\",\"state\":\"unknown\"}}") };
+        using (var s = new Servidor((n, p) => errs[n - 1]))
+        {
+            var api = Cliente(s, 0);
+            var e = Error(() => api.Get("/calls/out/999"));
+            Bien(e != null && e.Http == 404 && e.Code == "not_found" && e.Message == "Call not found" && e.Detail == "no call 999" && e.RequestId == "req-1"
+                 && (string)e.Response["status"] == "error" && typeof(MundoSMSException).GetProperty("StatusCode") == null,
+                 "un 404: Http, Code, Message, Detail, RequestId y Response");
+            var e2 = Error(() => api.Post("/whatsapp/messages", new { to = "1" }));
+            Bien(e2 != null && e2.Http == 200 && e2.Code == "whatsapp_rejected" && (string)e2.Data["id"] == "wam-1", "un 200 con status error es un error, con su Code");
+            var e3 = Error(() => api.Get("/calls"));
+            Bien(e3 != null && e3.Http == 502 && e3.Code == null && e3.Message == "HTTP 502" && e3.Response == null, "un 502 sin JSON: sin Code");
+            Bien((string)api.Post("/whatsapp/messages", new { to = "1" }).Data["state"] == "unknown", "el 202 de un WhatsApp sin confirmar no es un error");
         }
         using (var s = new Servidor((n, p) => { var r = Respuesta.Json(200, Ok); r.Lento = true; return r; }))
         {
@@ -291,12 +324,19 @@ public static class Pruebas
         }
 
         Console.WriteLine("== un DELETE que se hizo y perdió la respuesta");
-        string no = "{\"status\":\"error\",\"status_code\":\"4\",\"message\":\"Speed dial not found\"}";
+        string no = "{\"status\":\"error\",\"code\":\"not_found\",\"message\":\"Speed dial not found\"}";
         using (var s = new Servidor((n, p) => n == 1 ? null : Respuesta.Json(404, no)))
         {
             MundoSMSResponse r = null;
             Error(() => r = Cliente(s, 1).Delete("/speed-dials/9121"));
-            Bien(r != null && (string)r["message"] == "Already deleted" && false.Equals(r.Data["changed"]), "el 404 del reintento: ya estaba borrado");
+            Bien(r != null && (string)r["message"] == "Already deleted" && false.Equals(r.Data["changed"])
+                 && string.Join(",", r.Keys.OrderBy(k => k, StringComparer.Ordinal)) == "data,message,status", "el 404 del reintento: ya estaba borrado (sin code ni status_code)");
+        }
+        string ruta = "{\"status\":\"error\",\"code\":\"route_not_found\",\"message\":\"Route not found\"}";
+        using (var s = new Servidor((n, p) => n == 1 ? null : Respuesta.Json(404, ruta)))
+        {
+            var e = Error(() => Cliente(s, 1).Delete("/speed-dials/9121"));
+            Bien(e != null && e.Http == 404 && e.Code == "route_not_found", "tras el corte, route_not_found sigue siendo un error");
         }
         using (var s = new Servidor((n, p) => Respuesta.Json(404, no)))
         {
@@ -307,7 +347,7 @@ public static class Pruebas
         Console.WriteLine("== LastCursor es el del recorrido; LastRateLimit, el cupo de la última respuesta");
         using (var s = new Servidor((n, p) => p.Ruta.StartsWith("/v3/vacia") ? Respuesta.Json(200, "{\"status\":\"success\",\"data\":{\"results\":0,\"calls\":[],\"has_more\":false,\"next_cursor\":null}}")
                                               : p.Ruta.StartsWith("/v3/una") ? Respuesta.Json(200, "{\"status\":\"success\",\"data\":{\"results\":1,\"calls\":[{\"id\":1}],\"has_more\":false,\"next_cursor\":\"u1\"}}")
-                                              : Respuesta.Json(400, "{\"status\":\"error\",\"status_code\":\"3\",\"message\":\"Parameter cursor not valid\"}")))
+                                              : Respuesta.Json(400, "{\"status\":\"error\",\"code\":\"invalid_parameter\",\"message\":\"Parameter cursor not valid\"}")))
         {
             var api = Cliente(s, 0);
             api.All("/vacia", new { cursor = "c9" }).ToList();

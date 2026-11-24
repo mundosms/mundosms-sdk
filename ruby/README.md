@@ -30,7 +30,7 @@ end
 begin
   api.patch("/extensions/recepcion", { "record_calls" => true })
 rescue MundoSMS::Error => e
-  puts [e.http, e.status_code, e.message, e.detail, e.request_id].join(" ")
+  puts [e.http, e.code, e.message, e.detail, e.request_id].join(" ")
 end
 ```
 
@@ -39,7 +39,7 @@ end
 - `all(path, query)` recorre todas las páginas de un listado (un `Enumerator::Lazy`: pide cada página al llegar a ella).
   Al acabar, el último `next_cursor` queda en `last_cursor`; `last_rate_limit` es el cupo (`X-RateLimit-*`) de la última
   respuesta.
-- Cualquier error es un `MundoSMS::Error` con `http`, `status_code`, `message`, `detail`, `data`, `request_id` y `response`.
+- Cualquier error es un `MundoSMS::Error` con `http`, `code`, `message`, `detail`, `data`, `request_id` y `response`.
   Un WhatsApp sin confirmar (`202`, `data["state"]` `"unknown"`: puede haber salido) no es un error: vuelve la respuesta.
 - Cada `POST` lleva una `Idempotency-Key`, la misma en todos sus intentos; la tuya, con
   `api.post(path, data, idempotency_key: "pedido-881")`.

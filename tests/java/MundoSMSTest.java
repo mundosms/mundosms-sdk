@@ -28,7 +28,7 @@ import javax.crypto.spec.SecretKeySpec;
 public class MundoSMSTest {
     static final String TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI0MiIsInN1YiI6IjcifQ.cHJ1ZWJh";
     static final String KEY = "Pr4ebaClaveDe20Letra";
-    static final String OK = "{\"status\":\"success\",\"status_code\":\"0\",\"message\":\"OK\",\"data\":{\"id\":8812345}}";
+    static final String OK = "{\"status\":\"success\",\"message\":\"OK\",\"data\":{\"id\":8812345}}";
     static int fallos = 0;
 
     static void ok(boolean c, String que) {
@@ -79,7 +79,7 @@ public class MundoSMSTest {
 
     /**
      * Apunta cada petición (con su firma comprobada) y contesta con responde(n, petición). Una petición firmada que llega
-     * dos veces (el mismo X-Timestamp en la misma ruta: la repite el propio HttpURLConnection) da 409 «Duplicated request»,
+     * dos veces (el mismo X-Timestamp en la misma ruta: la repite el propio HttpURLConnection) da 409 duplicated_request,
      * como la API con «Rechazar peticiones repetidas».
      */
     static final class Servidor implements AutoCloseable {
@@ -126,7 +126,7 @@ public class MundoSMSTest {
                           .equals(p.cabeceras.get("x-signature"));
                 peticiones.add(p);
                 Respuesta r = vistas.add(p.ruta + " " + p.cabeceras.get("x-timestamp")) ? responde.apply(peticiones.size(), p)
-                            : json(409, "{\"status\":\"error\",\"status_code\":\"3\",\"message\":\"Duplicated request\"}");
+                            : json(409, "{\"status\":\"error\",\"code\":\"duplicated_request\",\"message\":\"Duplicated request\"}");
                 if (r == null) {
                     c.close();
                     return;
@@ -231,12 +231,43 @@ public class MundoSMSTest {
         ok(!MundoSMS.verifyWebhook("whsec_ejemplo", cab, cuerpo), "de hace más de 5 minutos, no");
 
         System.out.println("== reintentos y plazo");
-        try (Servidor s = new Servidor((n, p) -> n < 3 ? json(429, "{\"status\":\"error\",\"message\":\"Too many requests\"}").con("Retry-After", "0") : json(200, OK))) {
+        try (Servidor s = new Servidor((n, p) -> n < 3 ? json(429, "{\"status\":\"error\",\"code\":\"requests_per_second\",\"message\":\"Too many requests\"}").con("Retry-After", "0") : json(200, OK))) {
             ok("success".equals(cliente(s, 3, 60).get("/calls").get("status")) && s.peticiones.size() == 3, "un 429 se repite");
         }
-        try (Servidor s = new Servidor((n, p) -> json(500, "{\"status\":\"error\",\"status_code\":\"2\",\"message\":\"Internal error\"}"))) {
+        try (Servidor s = new Servidor((n, p) -> json(500, "{\"status\":\"error\",\"code\":\"internal_error\",\"message\":\"Internal error\"}"))) {
             MundoSMSError e = error(() -> cliente(s, 3, 60).post("/sms", MundoSMS.map("to", "1")));
-            ok(e != null && e.getHttp() == 500 && s.peticiones.size() == 1, "un POST con 5xx no se repite");
+            ok(e != null && e.getHttp() == 500 && "internal_error".equals(e.getCode()) && s.peticiones.size() == 1, "un POST con 5xx no se repite");
+        }
+        // un 409 se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con
+        // su clave) se repiten; otro 409, aunque su message diga lo mismo, no
+        String[][] casos409 = {{"GET", "duplicated_request", "Duplicated request", "3"}, {"PATCH", "duplicated_request", "Duplicated request", "3"},
+                               {"POST", "duplicated_request", "Duplicated request", "3"}, {"POST", "request_in_progress", "Request in progress", "3"},
+                               {"PATCH", "request_in_progress", "Request in progress", "1"}, {"POST", "already_exists", "Request in progress", "1"}};
+        for (String[] c : casos409) {
+            String b = "{\"status\":\"error\",\"code\":\"" + c[1] + "\",\"message\":\"" + c[2] + "\"}";
+            try (Servidor s = new Servidor((n, p) -> json(409, b).con("Retry-After", "0"))) {
+                MundoSMSError e = error(() -> cliente(s, 2, 60).request(c[0], "/x", MundoSMS.map("a", 1)));
+                ok(e != null && e.getHttp() == 409 && c[1].equals(e.getCode()) && s.peticiones.size() == Integer.parseInt(c[3]),
+                   "409 " + c[1] + " en " + c[0] + ": " + c[3] + " petición(es)");
+            }
+        }
+
+        System.out.println("== los campos del error");
+        Respuesta[] errs = {json(404, "{\"status\":\"error\",\"code\":\"not_found\",\"message\":\"Call not found\",\"detail\":\"no call 999\"}").con("X-Request-Id", "req-1"),
+                            json(200, "{\"status\":\"error\",\"code\":\"whatsapp_rejected\",\"message\":\"WhatsApp rejected it\",\"data\":{\"id\":\"wam-1\"}}"),
+                            new Respuesta(502, "text/html", "<html>Bad gateway</html>"),
+                            json(202, "{\"status\":\"success\",\"message\":\"Not confirmed\",\"data\":{\"id\":\"wam-2\",\"state\":\"unknown\"}}")};
+        try (Servidor s = new Servidor((n, p) -> errs[n - 1])) {
+            MundoSMS api = cliente(s, 0, 60);
+            MundoSMSError e = error(() -> api.get("/calls/out/999"));
+            ok(e != null && e.getHttp() == 404 && "not_found".equals(e.getCode()) && "Call not found".equals(e.getMessage()) && "no call 999".equals(e.getDetail())
+               && "req-1".equals(e.getRequestId()) && "error".equals(e.getResponse().get("status")), "un 404: http, code, message, detail, X-Request-Id y la respuesta");
+            ok(e != null && e.toString().endsWith("Call not found (HTTP 404, code not_found, detail: no call 999, X-Request-Id req-1)"), "toString con el code (" + e + ")");
+            MundoSMSError e2 = error(() -> api.post("/whatsapp/messages", MundoSMS.map("to", "1")));
+            ok(e2 != null && e2.getHttp() == 200 && "whatsapp_rejected".equals(e2.getCode()) && "wam-1".equals(en(e2.getData(), "id")), "un 200 con status error es un error, con su code");
+            MundoSMSError e3 = error(() -> api.get("/calls"));
+            ok(e3 != null && e3.getHttp() == 502 && e3.getCode() == null && "HTTP 502".equals(e3.getMessage()) && e3.getResponse() == null, "un 502 sin JSON: sin code");
+            ok("unknown".equals(en(api.post("/whatsapp/messages", MundoSMS.map("to", "1")), "data", "state")), "el 202 de un WhatsApp sin confirmar no es un error");
         }
         try (Servidor s = new Servidor((n, p) -> {
             Respuesta r = json(200, OK);
@@ -300,11 +331,17 @@ public class MundoSMSTest {
         }
 
         System.out.println("== un DELETE que se hizo y perdió la respuesta");
-        String no = "{\"status\":\"error\",\"status_code\":\"4\",\"message\":\"Speed dial not found\"}";
+        String no = "{\"status\":\"error\",\"code\":\"not_found\",\"message\":\"Speed dial not found\"}";
         try (Servidor s = new Servidor((n, p) -> n == 1 ? null : json(404, no))) {
             final List<Map<String, Object>> r = new ArrayList<Map<String, Object>>();
             error(() -> r.add(cliente(s, 1, 60).delete("/speed-dials/9121")));
-            ok(r.size() == 1 && "Already deleted".equals(r.get(0).get("message")) && Boolean.FALSE.equals(en(r.get(0), "data", "changed")), "el 404 del reintento: ya estaba borrado");
+            ok(r.size() == 1 && "Already deleted".equals(r.get(0).get("message")) && Boolean.FALSE.equals(en(r.get(0), "data", "changed"))
+               && r.get(0).keySet().equals(new HashSet<String>(Arrays.asList("status", "message", "data"))), "el 404 del reintento: ya estaba borrado (sin code ni status_code)");
+        }
+        String ruta = "{\"status\":\"error\",\"code\":\"route_not_found\",\"message\":\"Route not found\"}";
+        try (Servidor s = new Servidor((n, p) -> n == 1 ? null : json(404, ruta))) {
+            MundoSMSError e = error(() -> cliente(s, 1, 60).delete("/speed-dials/9121"));
+            ok(e != null && e.getHttp() == 404 && "route_not_found".equals(e.getCode()), "tras el corte, route_not_found sigue siendo un error");
         }
         try (Servidor s = new Servidor((n, p) -> json(404, no))) {
             MundoSMSError e = error(() -> cliente(s, 1, 60).delete("/speed-dials/9121"));
@@ -314,7 +351,7 @@ public class MundoSMSTest {
         System.out.println("== getLastCursor es el del recorrido; getLastRateLimit, el cupo de la última respuesta");
         try (Servidor s = new Servidor((n, p) -> p.ruta.startsWith("/v3/vacia") ? json(200, "{\"status\":\"success\",\"data\":{\"results\":0,\"calls\":[],\"has_more\":false,\"next_cursor\":null}}")
                                                   : p.ruta.startsWith("/v3/una") ? json(200, "{\"status\":\"success\",\"data\":{\"results\":1,\"calls\":[{\"id\":1}],\"has_more\":false,\"next_cursor\":\"u1\"}}")
-                                                  : json(400, "{\"status\":\"error\",\"status_code\":\"3\",\"message\":\"Parameter cursor not valid\"}"))) {
+                                                  : json(400, "{\"status\":\"error\",\"code\":\"invalid_parameter\",\"message\":\"Parameter cursor not valid\"}"))) {
             MundoSMS api = cliente(s, 0, 60);
             ids(api.all("/vacia", MundoSMS.map("cursor", "c9")));
             String c1 = api.getLastCursor();

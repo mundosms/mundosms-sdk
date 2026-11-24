@@ -30,17 +30,17 @@ for call in api.all("/calls", {"from_datetime": "2026-11-01"}):
 try:
     api.patch("/extensions/recepcion", {"record_calls": True})
 except MundoSMSError as e:
-    print(e.http, e.status_code, e.message, e.detail, e.request_id)
+    print(e.http, e.code, e.message, e.detail, e.request_id)
 ```
 
 - `get(path, query)`, `post(path, data)`, `patch(path, data)` y `delete(path, query)` devuelven la respuesta entera
-  (`status`, `status_code`, `message`, `data`). La ruta va sin `/v3`. En `get` y `delete` los filtros van en la query; en
+  (`status`, `message`, `data`). La ruta va sin `/v3`. En `get` y `delete` los filtros van en la query; en
   `post` y `patch`, los datos van en un cuerpo JSON. `request(method, path, data)` hace una petición cualquiera.
 - `all(path, query)` recorre todas las páginas de un listado y te da los elementos uno a uno. Al acabar, el último
   `next_cursor` queda en `last_cursor`.
 - Las rutas que devuelven un fichero (una grabación, una locución, el PDF de un certificado) vuelven como
   `{"status": "success", "content_type": …, "body": …}`, con el contenido en `bytes`.
-- Cualquier error es una excepción `MundoSMSError` con `http`, `status_code`, `message`, `detail`, `data`, `request_id` y
+- Cualquier error es una excepción `MundoSMSError` con `http`, `code`, `message`, `detail`, `data`, `request_id` y
   `response` (la respuesta entera), siempre que la API contesta con `"status": "error"`. Un WhatsApp sin confirmar (`202`,
   `data["state"]` `"unknown"`: puede haber salido) no es un error: vuelve la respuesta, y no se reenvía.
 - Cada `POST` lleva una `Idempotency-Key`, la misma en todos sus intentos: por eso se reintenta sin miedo si se queda sin

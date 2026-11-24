@@ -1,5 +1,63 @@
 # Cambios
 
+## v2.0.0
+
+**Cambia el error: si tu código lee `status_code`, cámbialo al actualizar.** La API REST deja de mandar `status_code`, en
+ninguna respuesta (ni buena ni de error), y cada error trae **`code`**: una palabra en inglés y en snake_case que dice qué
+falló (`missing_parameter`, `invalid_parameter`, `token_invalid`, `signature_invalid`, `permission_denied`, `not_found`,
+`insufficient_credit`, `whatsapp_window_closed`…; la lista, en el
+[Catálogo de errores](https://www.mundosms.es/api-v3#catalogo-de-errores)). Los siete clientes siguen a la API:
+
+- **`code` en vez de `status_code`:** `$e->code` en PHP (también `$e->getCode()`), `e.code` en Python, Node.js y Ruby,
+  `e.getCode()` en Java, y `e.Code` en C# y Go. Desaparecen `statusCode`, `status_code`, `getStatusCode()` y `StatusCode`,
+  sin alias. Cuando la respuesta no trae `code` (sin respuesta, una redirección o una respuesta que no es JSON), vale `null`
+  (`None` en Python, `nil` en Ruby y `""` en Go).
+- **Una respuesta buena no lleva `code` ni `status_code`,** tampoco la que da el propio SDK: el `DELETE` que se repite tras
+  quedarse sin respuesta y recibe un `404` vuelve como `{"status": "success", "message": "Already deleted", "data":
+  {"state": "deleted", "changed": false}}`, sin el `"status_code": "0"` de antes.
+- **Los reintentos se deciden por `code` y por el código HTTP,** nunca por el texto del mensaje: un `409` con
+  `duplicated_request` se repite en cualquier método, y uno con `request_in_progress`, en un `POST` con su
+  `Idempotency-Key`. Un `404` con `route_not_found` sigue siendo un error también tras un `DELETE` sin respuesta. Se repite
+  lo mismo que en la 1.2.
+- **Go: la ruta del módulo termina en `/v2`,** como pide Go a partir de la versión 2:
+  `github.com/mundosms/mundosms-sdk/go/v2`, en el `go get` y en el `import`. La etiqueta del módulo es `go/v2.0.0`.
+- El error en una línea dice `code not_found` donde decía `status_code 4`: `toString()` en Java y `Error()` en Go
+  (`… (HTTP 404, code not_found)`).
+- **Node.js (TypeScript):** `MundoSMSResponse` ya no tiene `status_code`, y `ErrorResponse` trae `code`.
+- **Campos de la API con otro nombre.** La respuesta llega entera, así que los verás en `data` y en `response`:
+  - WhatsApp: el `error_code` de los mensajes y de los destinatarios es ahora `whatsapp_error_code` (un entero o `null`), y
+    los destinatarios traen además `failure_code`;
+  - SMS, certificados y NumCheck: `error_code` es ahora `carrier_error_code` (un texto o `null`);
+  - llamadas: `state_code` (un número) es ahora `state_detail`, una palabra o `null` (`completed` o `interrupted` con
+    `answered`; `closing` o `hanging_up` con `ending`);
+  - lo que un error traía en `data.code` (`forwarding`, `has_cost`, `requests_per_second`…) va ahora en `code`, y no en
+    `data`.
+
+  `message`, `detail`, `data`, los códigos HTTP y las cabeceras no cambian, salvo una cosa: en WhatsApp, sin tarifa para ese
+  tipo de mensaje o con el cobro rechazado, la respuesta es `422` con `code` `no_tariff` o `charge_failed` (antes `500`
+  `Internal error`). No salió, y repetirlo no cambia nada: los SDK no lo reintentan.
+
+**Al actualizar:**
+
+1. Cambia `statusCode`, `status_code`, `getStatusCode()` o `StatusCode` por `code` (`getCode()` en Java, `Code` en C# y
+   Go).
+2. Si comparabas con un número (`"3"`, `"4"`…) o con el texto del mensaje, compara con la palabra de `code`.
+3. Si leías `data.code` de un error (por ejemplo, el `requests_per_second` de un `429`), léelo en `code`.
+4. Si lees `error_code` o `state_code` en `data`, usa los nombres nuevos de la lista de arriba (`state_code` pasa a
+   `state_detail`, que es una palabra).
+5. En Go, cambia la ruta del módulo en el `go get` y en el `import`.
+
+## v1.2.1
+
+Solo cambian la documentación y los comentarios del código: los siete clientes hacen lo mismo que en la 1.2.0.
+
+- **Un `500` con `Idempotency-Key`:** decían que la API no guarda los `5xx`. Guarda el `500`, porque puede llegar con la
+  operación hecha: el mismo `POST` con la misma clave te devuelve ese `500` (con `"idempotent_replayed": true` en la
+  `response` del error) y no lo vuelve a hacer. Compruébalo antes de repetirlo y, si no se hizo, repítelo con otra clave.
+- **Un `503` no hizo nada** ni se guarda: el SDK no lo repite solo en un `POST`, pero tú puedes repetirlo con la misma clave.
+- **`409 Extension already exists`** al repetir `POST /v3/extensions`: el nombre puede ser de otra cuenta. El README dice
+  cómo saberlo con `GET /v3/extensions/{extension}`.
+
 ## v1.2.0
 
 **Arreglo de seguridad: actualiza.** El cliente de **Python** (también la 1.0.0 de PyPI) seguía las redirecciones: si la

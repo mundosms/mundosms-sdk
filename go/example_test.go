@@ -14,7 +14,7 @@ import (
 	"os"
 	"time"
 
-	mundosms "github.com/mundosms/mundosms-sdk/go"
+	mundosms "github.com/mundosms/mundosms-sdk/go/v2"
 )
 
 func Example() {
@@ -31,7 +31,7 @@ func Example() {
 	_, err = api.Patch(ctx, "/extensions/recepcion", mundosms.Params{"record_calls": true})
 	var e *mundosms.Error
 	if errors.As(err, &e) {
-		fmt.Println(e.HTTP, e.StatusCode, e.Message, e.Detail, e.RequestID)
+		fmt.Println(e.HTTP, e.Code, e.Message, e.Detail, e.RequestID)
 	}
 }
 

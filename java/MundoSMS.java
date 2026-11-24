@@ -70,19 +70,20 @@ import javax.crypto.spec.SecretKeySpec;
  * que llegan), las listas como {@code List<Object>}, los textos como {@code String}, los números enteros como {@code Long}
  * (o {@code BigInteger} si no caben), los decimales como {@code Double}, y {@code Boolean} y {@code null}.
  *
- * <p>Errores: excepción {@link MundoSMSError} (no comprobada) con {@code getHttp()} (código HTTP), {@code getStatusCode()}
- * ("3", "4"…), {@code getMessage()}, {@code getDetail()}, {@code getData()}, {@code getResponse()} (la respuesta entera) y
+ * <p>Errores: excepción {@link MundoSMSError} (no comprobada) con {@code getHttp()} (código HTTP), {@code getCode()} (la
+ * palabra de la API: "not_found", "invalid_parameter"…), {@code getMessage()}, {@code getDetail()}, {@code getData()}, {@code getResponse()} (la respuesta entera) y
  * {@code getRequestId()} (la cabecera X-Request-Id). También cuando la API contesta con "status": "error", venga con el código HTTP que venga. Un WhatsApp sin
  * confirmar (202) no es un error: vuelve la respuesta, con data.state "unknown".
  *
  * <p>Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
  * {@code api.post(path, data, new MundoSMS.RequestOptions().idempotencyKey("pedido-881"))}). Por eso un POST que falla por
- * la red, o con 409 «Request in progress», se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada
+ * la red, o con 409 request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada
  * de la primera vez, trae {@code "idempotent_replayed"} = {@code Boolean.TRUE}.
  *
  * <p>Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un
- * POST con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como
- * mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho:
+ * POST con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
+ * repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
+ * diga Retry-After (como mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho:
  * vuelve como éxito, con data.changed {@code false}.
  *
  * <p>Una redirección (3xx) no se sigue nunca: es un {@link MundoSMSError} (la API no redirige). Un 2xx que no es JSON (el HTML
@@ -98,7 +99,7 @@ import javax.crypto.spec.SecretKeySpec;
 public class MundoSMS {
 
     /** La versión de este cliente: va también en el User-Agent. */
-    public static final String VERSION = "1.2.0";
+    public static final String VERSION = "2.0.0";
 
     /** Los segundos que puede alejarse de tu hora la «t» de la firma de un aviso, si no dices otra cosa. */
     public static final long WEBHOOK_TOLERANCE = 300;
@@ -315,7 +316,7 @@ public class MundoSMS {
      * Una consulta sin filtros.
      *
      * @param path "/calls", "/numbers/34910123456"… (sin /v3)
-     * @return la respuesta entera ({@code status}, {@code status_code}, {@code message}, {@code data})
+     * @return la respuesta entera ({@code status}, {@code message}, {@code data})
      * @throws MundoSMSError si la API contesta con un error o no contesta
      */
     public Map<String, Object> get(String path) {
@@ -589,15 +590,13 @@ public class MundoSMS {
                 }
                 if (!"error".equals(j.get("status"))) return j;
             }
-            if (verb.equals("DELETE") && afterNetwork && http == 404 && j != null
-                && !String.valueOf(j.get("message")).startsWith("Route not found")) {
+            if (verb.equals("DELETE") && afterNetwork && http == 404 && j != null && !"route_not_found".equals(code(j))) {
                 // lo borró el intento que se quedó sin respuesta
                 Map<String, Object> d = new LinkedHashMap<String, Object>();
                 d.put("state", "deleted");
                 d.put("changed", Boolean.FALSE);
                 Map<String, Object> ok = new LinkedHashMap<String, Object>();
                 ok.put("status", "success");
-                ok.put("status_code", "0");
                 ok.put("message", "Already deleted");
                 ok.put("data", d);
                 return ok;
@@ -605,7 +604,7 @@ public class MundoSMS {
             if (j != null) {
                 String message = asText(j.get("message"));
                 if (message == null || message.isEmpty()) message = "Error";
-                throw new MundoSMSError(message, http, asText(j.get("status_code")), asText(j.get("detail")), j, j.get("data"), r.requestId);
+                throw new MundoSMSError(message, http, code(j), asText(j.get("detail")), j, j.get("data"), r.requestId);
             }
             throw new MundoSMSError("HTTP " + http, http, null, null, null, null, r.requestId);
         }
@@ -613,26 +612,30 @@ public class MundoSMS {
 
     /**
      * Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un
-     * fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 «Request in progress». Un 5xx de un POST
-     * no: la API no guarda los 5xx y repetirlo lo haría otra vez.
+     * fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST
+     * no: un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo
+     * nada, pero repetirlo con la misma clave se deja a tu código.
      */
     private static boolean retryable(String verb, boolean network, int http, Map<String, Object> j, String idemKey) {
         if (http == 429) return true;
         // Un GET o un DELETE que se corta tras mandarlo lo repite el propio HttpURLConnection con la MISMA firma; con «Rechazar
         // peticiones repetidas», esa copia da 409 Duplicated request (la MISMA petición firmada llegó dos veces): es un fallo
         // de red más, en cualquier método.
-        Object message = j == null ? null : j.get("message");
         network = network || duplicated(http, j);
         if (verb.equals("GET")) return network || http >= 500;
         if (verb.equals("PATCH") || verb.equals("DELETE")) return network;
-        if (idemKey != null) return network || (http == 409 && "Request in progress".equals(message));
+        if (idemKey != null) return network || (http == 409 && "request_in_progress".equals(code(j)));
         return false;
     }
 
-    /** 409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
+    /** 409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
     private static boolean duplicated(int http, Map<String, Object> j) {
-        Object m = j == null ? null : j.get("message");
-        return http == 409 && m instanceof String && ((String) m).startsWith("Duplicated request");
+        return http == 409 && "duplicated_request".equals(code(j));
+    }
+
+    /** El code de una respuesta de error ("duplicated_request"…) como texto, o {@code null} si no lo trae. */
+    private static String code(Map<String, Object> j) {
+        return j == null ? null : asText(j.get("code"));
     }
 
     /** Lo que la API da como fichero (grabaciones, locuciones, diagramas y el PDF de un certificado), por su Content-Type. */
@@ -775,8 +778,8 @@ public class MundoSMS {
         private static final long serialVersionUID = 1L;
         /** El código HTTP, 0 si no hubo respuesta. */
         private final int http;
-        /** El status_code de la API. */
-        private final String statusCode;
+        /** El code de la API. */
+        private final String code;
         /** El detail de la API. */
         private final String detail;
         private final transient Map<String, Object> response;
@@ -798,16 +801,16 @@ public class MundoSMS {
          *
          * @param message    el message de la API, o «HTTP 502» si no contestó en JSON
          * @param http       el código HTTP, 0 si no hubo respuesta
-         * @param statusCode el status_code de la API
+         * @param code       el code de la API ("not_found"…), o {@code null}
          * @param detail     el detail de la API
          * @param response   la respuesta entera, decodificada
          * @param data       el data de la respuesta
          * @param requestId  la cabecera X-Request-Id
          */
-        public MundoSMSError(String message, int http, String statusCode, String detail, Map<String, Object> response, Object data, String requestId) {
+        public MundoSMSError(String message, int http, String code, String detail, Map<String, Object> response, Object data, String requestId) {
             super(message);
             this.http = http;
-            this.statusCode = statusCode;
+            this.code = code;
             this.detail = detail;
             this.response = response;
             this.data = data;
@@ -824,12 +827,14 @@ public class MundoSMS {
         }
 
         /**
-         * El status_code de la API, en texto: "3", "4"…
+         * El code de la API: la palabra que dice qué falló, en inglés y snake_case ("not_found", "invalid_parameter",
+         * "insufficient_credit"…).
          *
-         * @return el status_code, o {@code null} si la respuesta no lo trae
+         * @return el code, o {@code null} si la respuesta no lo trae (sin respuesta, una redirección o una respuesta que no es
+         *         JSON)
          */
-        public String getStatusCode() {
-            return statusCode;
+        public String getCode() {
+            return code;
         }
 
         /**
@@ -869,7 +874,7 @@ public class MundoSMS {
         }
 
         /**
-         * El mensaje con el código HTTP, el status_code, el detail y el X-Request-Id: lo que hace falta en un registro.
+         * El mensaje con el código HTTP, el code, el detail y el X-Request-Id: lo que hace falta en un registro.
          *
          * @return el error en una línea
          */
@@ -878,7 +883,7 @@ public class MundoSMS {
             StringBuilder sb = new StringBuilder(getClass().getName()).append(": ").append(getMessage());
             List<String> extra = new ArrayList<String>();
             if (http != 0) extra.add("HTTP " + http);
-            if (statusCode != null) extra.add("status_code " + statusCode);
+            if (code != null) extra.add("code " + code);
             if (detail != null) extra.add("detail: " + detail);
             if (requestId != null) extra.add("X-Request-Id " + requestId);
             if (!extra.isEmpty()) sb.append(" (").append(String.join(", ", extra)).append(')');
@@ -974,7 +979,7 @@ public class MundoSMS {
                 done = true;
                 throw new MundoSMSError("MundoSMS: all() cannot go through " + path + ": it has more (has_more) but no next_cursor, so the list "
                                         + "is not paginated: raise limit or narrow the filters, and read it with get()",
-                                        200, asText(r.get("status_code")), null, r, data, null);
+                                        200, null, null, r, data, null);
             }
             if (listKey == null) {   // la lista es el primer campo que es una lista: un objeto ({}) no lo es
                 for (Map.Entry<?, ?> e : data.entrySet()) {

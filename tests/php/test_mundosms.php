@@ -17,7 +17,7 @@ foreach (array(__DIR__ . "/../../php/mundosms.php", __DIR__ . "/../../mundosms.p
 
 const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI0MiIsInN1YiI6IjcifQ.cHJ1ZWJh";
 const KEY = "Pr4ebaClaveDe20Letra";
-const OK = '{"status":"success","status_code":"0","message":"OK","data":{"id":8812345}}';
+const OK = '{"status":"success","message":"OK","data":{"id":8812345}}';
 
 /** La firma de «La firma» de la documentación: base64url, sin relleno, del HMAC-SHA256. */
 function firma($clave, $token, $ts, $metodo, $ruta, $cuerpo = "")
@@ -134,13 +134,40 @@ ok(MundoSMS::verifyWebhook("whsec_ejemplo", $cab, str_replace("delivered", "Deli
 ok(MundoSMS::verifyWebhook("whsec_ejemplo", $cab, $cuerpo) === false, "de hace más de 5 minutos, no");
 
 echo "== reintentos y plazo\n";
-plan(array(json(429, '{"status":"error","message":"Too many requests"}', array("Retry-After" => "0")),
-           json(429, '{"status":"error","message":"Too many requests"}', array("Retry-After" => "0")), json(200, OK)));
+plan(array(json(429, '{"status":"error","code":"requests_per_second","message":"Too many requests"}', array("Retry-After" => "0")),
+           json(429, '{"status":"error","code":"requests_per_second","message":"Too many requests"}', array("Retry-After" => "0")), json(200, OK)));
 ok((cliente()->get("/calls")["status"] ?? null) === "success" && count(array_unique(array_map(function ($x) { return $x["cabeceras"]["x-timestamp"]; }, peticiones()))) === 3,
    "un 429 se repite, con otro X-Timestamp cada vez");
-plan(array(json(500, '{"status":"error","status_code":"2","message":"Internal error"}')));
+plan(array(json(500, '{"status":"error","code":"internal_error","message":"Internal error"}')));
 $e = error(function () { cliente()->post("/sms", array("to" => "1")); });
-ok($e && $e->http === 500 && count(peticiones()) === 1, "un POST con 5xx no se repite");
+ok($e && $e->http === 500 && $e->code === "internal_error" && count(peticiones()) === 1, "un POST con 5xx no se repite");
+// un 409 se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con su
+// clave) se repiten; otro 409, aunque su message diga lo mismo, no
+foreach (array(array("GET", "duplicated_request", "Duplicated request", 3), array("PATCH", "duplicated_request", "Duplicated request", 3),
+               array("POST", "duplicated_request", "Duplicated request", 3), array("POST", "request_in_progress", "Request in progress", 3),
+               array("PATCH", "request_in_progress", "Request in progress", 1), array("POST", "already_exists", "Request in progress", 1)) as $c) {
+    list($metodo, $code, $mensaje, $n) = $c;
+    $r409 = json(409, array("status" => "error", "code" => $code, "message" => $mensaje), array("Retry-After" => "0"));
+    plan(array($r409, $r409, $r409));
+    $e = error(function () use ($metodo) { cliente(array("retries" => 2))->request($metodo, "/x", array("a" => 1)); });
+    ok($e && $e->http === 409 && $e->code === $code && count(peticiones()) === $n, "409 $code en $metodo: $n petición(es)");
+}
+
+echo "== los campos del error\n";
+plan(array(json(404, '{"status":"error","code":"not_found","message":"Call not found","detail":"no call 999"}', array("X-Request-Id" => "req-1")),
+           json(200, '{"status":"error","code":"whatsapp_rejected","message":"WhatsApp rejected it","data":{"id":"wam-1"}}'),
+           array("estado" => 502, "cabeceras" => array("Content-Type" => "text/html"), "cuerpo" => "<html>Bad gateway</html>"),
+           json(202, '{"status":"success","message":"Not confirmed","data":{"id":"wam-2","state":"unknown"}}')));
+$api = cliente(array("retries" => 0));
+$e = error(function () use ($api) { $api->get("/calls/out/999"); });
+ok($e && $e->http === 404 && $e->code === "not_found" && $e->getCode() === "not_found" && $e->getMessage() === "Call not found"
+   && $e->detail === "no call 999" && $e->requestId === "req-1" && ($e->response["status"] ?? null) === "error" && !property_exists($e, "statusCode"),
+   "un 404: http, code (también getCode()), message, detail, requestId y response");
+$e = error(function () use ($api) { $api->post("/whatsapp/messages", array("to" => "1")); });
+ok($e && $e->http === 200 && $e->code === "whatsapp_rejected" && ($e->data["id"] ?? null) === "wam-1", "un 200 con status error es un error, con su code");
+$e = error(function () use ($api) { $api->get("/calls"); });
+ok($e && $e->http === 502 && $e->code === null && $e->getMessage() === "HTTP 502" && $e->response === null, "un 502 sin JSON: sin code");
+ok(($api->post("/whatsapp/messages", array("to" => "1"))["data"]["state"] ?? null) === "unknown", "el 202 de un WhatsApp sin confirmar no es un error");
 plan(array(json(200, OK) + array("lento" => true)));
 $t0 = microtime(true);
 $e = error(function () { cliente(array("timeout" => 0.3, "retries" => 0))->get("/calls"); });
@@ -188,18 +215,22 @@ $p = peticiones()[0];
 ok($p["ruta"] === "/v3/calls?from_datetime=2026-11-20T10%3A15%3A03%2B01%3A00&a=%20" && $p["firma"], "%2B, y la firma casa");
 
 echo "== un DELETE que se hizo y perdió la respuesta\n";
-plan(array(array("corta" => true), json(404, '{"status":"error","status_code":"4","message":"Speed dial not found"}')));
+plan(array(array("corta" => true), json(404, '{"status":"error","code":"not_found","message":"Speed dial not found"}')));
 $r = null;
 error(function () use (&$r) { $r = cliente(array("retries" => 1))->delete("/speed-dials/9121"); });
-ok(($r["message"] ?? null) === "Already deleted" && ($r["data"]["changed"] ?? null) === false && count(peticiones()) === 2, "el 404 del reintento: ya estaba borrado");
-plan(array(json(404, '{"status":"error","status_code":"4","message":"Speed dial not found"}')));
+ok($r === array("status" => "success", "message" => "Already deleted", "data" => array("state" => "deleted", "changed" => false)) && count(peticiones()) === 2,
+   "el 404 del reintento: ya estaba borrado (sin code ni status_code)");
+plan(array(array("corta" => true), json(404, '{"status":"error","code":"route_not_found","message":"Route not found"}')));
+$e = error(function () { cliente(array("retries" => 1))->delete("/speed-dials/9121"); });
+ok($e && $e->http === 404 && $e->code === "route_not_found", "tras el corte, route_not_found sigue siendo un error");
+plan(array(json(404, '{"status":"error","code":"not_found","message":"Speed dial not found"}')));
 $e = error(function () { cliente(array("retries" => 1))->delete("/speed-dials/9121"); });
 ok($e && $e->http === 404, "sin fallo de red antes, un 404 es un error");
 
 echo "== lastCursor es el del recorrido; lastRateLimit, el cupo de la última respuesta\n";
 plan(array(), array("/v3/vacia" => json(200, '{"status":"success","data":{"results":0,"calls":[],"has_more":false,"next_cursor":null}}'),
                     "/v3/una" => json(200, '{"status":"success","data":{"results":1,"calls":[{"id":1}],"has_more":false,"next_cursor":"u1"}}'),
-                    "/v3/error" => json(400, '{"status":"error","status_code":"3","message":"Parameter cursor not valid"}')));
+                    "/v3/error" => json(400, '{"status":"error","code":"invalid_parameter","message":"Parameter cursor not valid"}')));
 $api = cliente(array("retries" => 0));
 foreach ($api->all("/vacia", array("cursor" => "c9")) as $x) {}
 $c1 = $api->lastCursor;

@@ -37,7 +37,7 @@ class Program
         }
         catch (MundoSMSException e)
         {
-            Console.WriteLine($"{e.Http} {e.StatusCode} {e.Message} {e.Detail} {e.RequestId}");
+            Console.WriteLine($"{e.Http} {e.Code} {e.Message} {e.Detail} {e.RequestId}");
         }
     }
 }
@@ -52,7 +52,7 @@ class Program
 - `All` (y `AllAsync`, con `await foreach`, en .NET 6 o superior) recorre todas las páginas de un listado y te da los
   elementos uno a uno. Al acabar, el último `next_cursor` queda en `LastCursor`. `LastRateLimit` es el cupo
   (`X-RateLimit-*`) de la última respuesta.
-- Cualquier error es una `MundoSMSException` con `Http`, `StatusCode`, `Message`, `Detail`, `Data`, `RequestId` y
+- Cualquier error es una `MundoSMSException` con `Http`, `Code`, `Message`, `Detail`, `Data`, `RequestId` y
   `Response` (la respuesta entera). Un WhatsApp sin confirmar (`202`, `data.state` `"unknown"`: puede haber salido) no es un
   error: vuelve la respuesta, y no se reenvía.
 - Cada `POST` lleva una `Idempotency-Key`, la misma en todos sus intentos. La tuya (el id de tu pedido, por ejemplo):

@@ -9,16 +9,17 @@
 //   Console.WriteLine(r.Data["id"]);
 //   foreach (var call in api.All("/calls", new { from_datetime = "2026-11-01", stop_at_ongoing = true })) { ... }
 //
-// Errores: excepción MundoSMSException con .Http (código HTTP), .StatusCode ("3", "4"…), .Message, .Detail, .Data,
-// .Response (la respuesta entera) y .RequestId (la cabecera X-Request-Id). También cuando la API contesta con "status": "error", venga con el código HTTP que
+// Errores: excepción MundoSMSException con .Http (código HTTP), .Code (la palabra de la API: "not_found", "invalid_parameter"…),
+// .Message, .Detail, .Data, .Response (la respuesta entera) y .RequestId (la cabecera X-Request-Id). También cuando la API contesta con "status": "error", venga con el código HTTP que
 // venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta, con data.state "unknown".
 // Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
 // api.PostAsync(path, data, new MundoSMSRequestOptions { IdempotencyKey = "pedido-881" })). Por eso un POST que falla por
-// la red, o con 409 «Request in progress», se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de
+// la red, o con 409 request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de
 // la primera vez, r.IdempotentReplayed es true (y r["idempotent_replayed"] también).
 // Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
-// con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como mucho
-// 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
+// con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
+// repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
+// diga Retry-After (como mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
 // como éxito, con data.changed false.
 // Una redirección (3xx) no se sigue nunca: es una MundoSMSException (la API no redirige, y seguirla llevaría tu firma y tus
 // datos a otro servidor); un HttpClient tuyo que las sigue no se acepta. Un 2xx que no es JSON (el HTML de un proxy o de un
@@ -60,13 +61,13 @@ namespace MundoSMS
         }
 
         /// <summary>Crea el error. Lo normal es no crearlo tú: lo lanza <see cref="MundoSMSClient"/>.</summary>
-        public MundoSMSException(string message, int http = 0, string statusCode = null, string detail = null,
+        public MundoSMSException(string message, int http = 0, string code = null, string detail = null,
                                  Dictionary<string, object> response = null, Dictionary<string, object> data = null,
                                  string requestId = null)
             : base(message)
         {
             Http = http;
-            StatusCode = statusCode;
+            Code = code;
             Detail = detail;
             Response = response;
             Data = data;
@@ -76,8 +77,11 @@ namespace MundoSMS
         /// <summary>El código HTTP de la respuesta; 0 si no hubo respuesta.</summary>
         public int Http { get; private set; }
 
-        /// <summary>El <c>status_code</c> de la API, como texto ("3", "4"…); null si la respuesta no era JSON.</summary>
-        public string StatusCode { get; private set; }
+        /// <summary>
+        /// El <c>code</c> de la API: la palabra que dice qué falló, en inglés y snake_case ("not_found", "invalid_parameter",
+        /// "insufficient_credit"…); null si la respuesta no lo trae (sin respuesta, una redirección o una respuesta que no es JSON).
+        /// </summary>
+        public string Code { get; private set; }
 
         /// <summary>El <c>detail</c> de la API (qué falló exactamente), o null.</summary>
         public string Detail { get; private set; }
@@ -96,8 +100,7 @@ namespace MundoSMS
     }
 
     /// <summary>
-    /// La respuesta de la API: el JSON entero como diccionario (<c>status</c>, <c>status_code</c>, <c>message</c>,
-    /// <c>data</c>). Una respuesta que no es JSON (un audio, un PDF, un 204) vuelve con <c>status</c> = "success",
+    /// La respuesta de la API: el JSON entero como diccionario (<c>status</c>, <c>message</c>, <c>data</c>). Una respuesta que no es JSON (un audio, un PDF, un 204) vuelve con <c>status</c> = "success",
     /// <c>content_type</c> y <c>body</c> (los bytes, también en <see cref="Body"/>).
     /// Los objetos JSON llegan como <c>Dictionary&lt;string, object&gt;</c>, las listas como <c>List&lt;object&gt;</c>, los
     /// enteros como <c>long</c>, los decimales como <c>double</c>, y además <c>string</c>, <c>bool</c> y null.
@@ -190,7 +193,7 @@ namespace MundoSMS
     public class MundoSMSClient
     {
         /// <summary>La versión del SDK.</summary>
-        public const string Version = "1.2.0";
+        public const string Version = "2.0.0";
 
         /// <summary>Los segundos que puede alejarse de tu hora la «t» de la firma de un aviso, si no dices otra cosa.</summary>
         public const long WebhookTolerance = 300;
@@ -457,15 +460,14 @@ namespace MundoSMS
         /// <summary>Una lista que no va por páginas (has_more sin next_cursor) no se puede recorrer entera.</summary>
         private static void CheckPaginated(string path, MundoSMSResponse r, Dictionary<string, object> data)
         {
-            object hasMore, results, cursor, statusCode;
+            object hasMore, results, cursor;
             data.TryGetValue("has_more", out hasMore);
             data.TryGetValue("results", out results);
             data.TryGetValue("next_cursor", out cursor);
             if (!Truthy(hasMore) || !Truthy(results) || Truthy(cursor)) return;
-            r.TryGetValue("status_code", out statusCode);
             throw new MundoSMSException("MundoSMS: all() cannot go through " + path + ": it has more (has_more) but no next_cursor, so the list " +
                                         "is not paginated: raise limit or narrow the filters, and read it with Get", r.Http,
-                                        statusCode == null ? null : ToText(statusCode), null, r, data, r.RequestId);
+                                        null, null, r, data, r.RequestId);
         }
 
         /// <summary>La lista de una página: el primer campo de <c>data</c> que es una lista (calls, dids…).</summary>
@@ -675,27 +677,22 @@ namespace MundoSMS
                         return result;
                     }
                 }
-                object deleteMessage = null;
-                if (method == "DELETE" && afterNetwork && httpStatus == 404 && obj != null
-                    && !(obj.TryGetValue("message", out deleteMessage) && deleteMessage is string && ((string)deleteMessage).StartsWith("Route not found", StringComparison.Ordinal)))
+                if (method == "DELETE" && afterNetwork && httpStatus == 404 && obj != null && ApiCode(obj) != "route_not_found")
                 {
                     // lo borró el intento que se quedó sin respuesta (Http es el 404 de la API)
                     var deleted = new MundoSMSResponse { Http = httpStatus, ContentType = contentType, RequestId = requestId };
                     deleted["status"] = "success";
-                    deleted["status_code"] = "0";
                     deleted["message"] = "Already deleted";
                     deleted["data"] = new Dictionary<string, object>(StringComparer.Ordinal) { { "state", "deleted" }, { "changed", false } };
                     return deleted;
                 }
                 if (obj != null)
                 {
-                    object messageValue, statusCodeValue, detailValue, dataValue;
+                    object messageValue, detailValue, dataValue;
                     obj.TryGetValue("message", out messageValue);
-                    obj.TryGetValue("status_code", out statusCodeValue);
                     obj.TryGetValue("detail", out detailValue);
                     obj.TryGetValue("data", out dataValue);
-                    throw new MundoSMSException(messageValue == null ? "Error" : ToText(messageValue), httpStatus,
-                                                statusCodeValue == null ? null : ToText(statusCodeValue),
+                    throw new MundoSMSException(messageValue == null ? "Error" : ToText(messageValue), httpStatus, ApiCode(obj),
                                                 detailValue == null ? null : ToText(detailValue), obj,
                                                 dataValue as Dictionary<string, object>, requestId);
                 }
@@ -705,29 +702,33 @@ namespace MundoSMS
 
         /// <summary>
         /// Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un
-        /// fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 «Request in progress». Un 5xx de un POST
-        /// no: la API no guarda los 5xx y repetirlo lo haría otra vez. Un 409 «Duplicated request» (la MISMA petición firmada llegó
-        /// dos veces: la repitió algo entre medias, como hace HttpClient con una conexión reutilizada que se cerró) es un fallo de
-        /// red más.
+        /// fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST
+        /// no: un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo
+        /// nada, pero repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada
+        /// llegó dos veces: la repitió algo entre medias, como hace HttpClient con una conexión reutilizada que se cerró) es un
+        /// fallo de red más.
         /// </summary>
         private static bool IsRetryable(string method, bool network, int httpStatus, Dictionary<string, object> json, string idempotencyKey)
         {
             if (httpStatus == 429) return true;
-            object m;
-            string message = json != null && json.TryGetValue("message", out m) ? m as string : null;
             network = network || IsDuplicated(httpStatus, json);
             if (method == "GET") return network || httpStatus >= 500;
             if (method == "PATCH" || method == "DELETE") return network;
-            if (idempotencyKey != null) return network || (httpStatus == 409 && message == "Request in progress");
+            if (idempotencyKey != null) return network || (httpStatus == 409 && ApiCode(json) == "request_in_progress");
             return false;
         }
 
-        /// <summary>409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias).</summary>
+        /// <summary>409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias).</summary>
         private static bool IsDuplicated(int httpStatus, Dictionary<string, object> json)
         {
-            object m;
-            string message = json != null && json.TryGetValue("message", out m) ? m as string : null;
-            return httpStatus == 409 && message != null && message.StartsWith("Duplicated request", StringComparison.Ordinal);
+            return httpStatus == 409 && ApiCode(json) == "duplicated_request";
+        }
+
+        /// <summary>El <c>code</c> de una respuesta de error ("duplicated_request"…) como texto, o null si no lo trae.</summary>
+        private static string ApiCode(Dictionary<string, object> json)
+        {
+            object c;
+            return json != null && json.TryGetValue("code", out c) && c != null ? ToText(c) : null;
         }
 
         /// <summary>Lo que la API da como fichero (grabaciones, locuciones, diagramas y el PDF de un certificado), por su Content-Type.</summary>
@@ -834,7 +835,7 @@ namespace MundoSMS
         /// <summary>
         /// El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso (también desde
         /// varios hilos). Dos peticiones iguales en el mismo milisegundo (dos a la vez, o un reintento tras un 429 con
-        /// Retry-After: 0) firmarían igual, y la API rechazaría la segunda por repetida («409 Duplicated request»).
+        /// Retry-After: 0) firmarían igual, y la API rechazaría la segunda por repetida («409 duplicated_request»).
         /// </summary>
         private static string Timestamp()
         {

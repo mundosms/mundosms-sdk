@@ -32,7 +32,7 @@ async function main() {
     await api.patch("/extensions/recepcion", { record_calls: true });
   } catch (e) {
     if (!(e instanceof MundoSMSError)) throw e;
-    console.log(e.http, e.statusCode, e.message, e.detail, e.requestId);
+    console.log(e.http, e.code, e.message, e.detail, e.requestId);
   }
 }
 
@@ -40,13 +40,13 @@ main().catch((e) => { console.error(e); process.exitCode = 1; });
 ```
 
 - `get(path, query)`, `post(path, data)`, `patch(path, data)` y `delete(path, query)` devuelven la respuesta entera
-  (`status`, `status_code`, `message`, `data`). La ruta va sin `/v3`. En `get` y `delete` los filtros van en la query; en
+  (`status`, `message`, `data`). La ruta va sin `/v3`. En `get` y `delete` los filtros van en la query; en
   `post` y `patch`, los datos van en un cuerpo JSON. `request(method, path, data, options)` hace una petición cualquiera.
 - `all(path, query)` recorre todas las páginas de un listado y te da los elementos uno a uno (`for await`). Al acabar,
   el último `next_cursor` queda en `lastCursor`.
 - Las rutas que devuelven un fichero (una grabación, una locución, el PDF de un certificado) vuelven como
   `{ status: "success", content_type, body }`, con el contenido en un `Buffer`.
-- Cualquier error es una excepción `MundoSMSError` con `http`, `statusCode`, `message`, `detail`, `data`, `requestId` y
+- Cualquier error es una excepción `MundoSMSError` con `http`, `code`, `message`, `detail`, `data`, `requestId` y
   `response` (la respuesta entera), siempre que la API contesta con `"status": "error"`. Un WhatsApp sin confirmar (`202`,
   `data.state` `"unknown"`: puede haber salido) no es un error: vuelve la respuesta, y no se reenvía.
 - Cada `POST` lleva una `Idempotency-Key`, la misma en todos sus intentos: por eso se reintenta sin miedo si se queda sin

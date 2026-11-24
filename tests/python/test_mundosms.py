@@ -22,7 +22,7 @@ from mundosms import MundoSMS, MundoSMSError  # noqa: E402
 
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiI0MiIsInN1YiI6IjcifQ.cHJ1ZWJh"
 KEY = "Pr4ebaClaveDe20Letra"
-OK = {"status": "success", "status_code": "0", "message": "OK", "data": {"id": 8812345}}
+OK = {"status": "success", "message": "OK", "data": {"id": 8812345}}
 
 
 def firma(clave, token, ts, metodo, ruta, cuerpo=b""):
@@ -124,13 +124,49 @@ class Pruebas(unittest.TestCase):
         self.assertFalse(MundoSMS.verify_webhook("whsec_ejemplo", cab, cuerpo))   # de hace más de 5 minutos
 
     def test_reintentos(self):
-        s = self.servidor(lambda n, p: (429, {"Retry-After": "0"}, {"status": "error", "message": "Too many requests"}) if n < 3 else (200, {}, OK))
+        s = self.servidor(lambda n, p: (429, {"Retry-After": "0"}, {"status": "error", "code": "requests_per_second", "message": "Too many requests"}) if n < 3 else (200, {}, OK))
         self.assertEqual(self.cliente(s).get("/calls")["status"], "success")
         self.assertEqual(len({x["cabeceras"]["X-Timestamp"] for x in s.peticiones}), 3)
-        s = self.servidor(lambda n, p: (500, {}, {"status": "error", "status_code": "2", "message": "Internal error"}))
+        s = self.servidor(lambda n, p: (500, {}, {"status": "error", "code": "internal_error", "message": "Internal error"}))
         with self.assertRaises(MundoSMSError) as e:
             self.cliente(s).post("/sms", {"to": "1"})
-        self.assertEqual([e.exception.http, len(s.peticiones)], [500, 1])   # un POST con 5xx no se repite
+        self.assertEqual([e.exception.http, e.exception.code, len(s.peticiones)], [500, "internal_error", 1])   # un POST con 5xx no se repite
+
+    def test_409(self):
+        # se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con su
+        # clave) se repiten; otro 409, aunque su message diga lo mismo, no
+        casos = [("GET", "duplicated_request", "Duplicated request", 3), ("PATCH", "duplicated_request", "Duplicated request", 3),
+                 ("POST", "duplicated_request", "Duplicated request", 3), ("POST", "request_in_progress", "Request in progress", 3),
+                 ("PATCH", "request_in_progress", "Request in progress", 1), ("POST", "already_exists", "Request in progress", 1)]
+        for metodo, code, mensaje, n in casos:
+            s = self.servidor(lambda _n, _p: (409, {"Retry-After": "0"}, {"status": "error", "code": code, "message": mensaje}))
+            with self.assertRaises(MundoSMSError) as e:
+                self.cliente(s, retries=2).request(metodo, "/x", {"a": 1})
+            self.assertEqual([e.exception.http, e.exception.code, len(s.peticiones)], [409, code, n], (metodo, code))
+
+    def test_errores(self):
+        r = [(404, {"X-Request-Id": "req-1"}, {"status": "error", "code": "not_found", "message": "Call not found", "detail": "no call 999"}),
+             (200, {}, {"status": "error", "code": "whatsapp_rejected", "message": "WhatsApp rejected it", "data": {"id": "wam-1"}}),
+             (502, {"Content-Type": "text/html"}, b"<html>Bad gateway</html>"),
+             (202, {}, {"status": "success", "message": "Not confirmed", "data": {"id": "wam-2", "state": "unknown"}}),
+             (400, {}, {"status": "error", "message": "Sin code"})]
+        api = self.cliente(self.servidor(lambda n, p: r[n - 1]), retries=0)
+        with self.assertRaises(MundoSMSError) as e:
+            api.get("/calls/out/999")
+        x = e.exception
+        self.assertEqual([x.http, x.code, x.message, x.detail, x.request_id, x.response["status"]],
+                         [404, "not_found", "Call not found", "no call 999", "req-1", "error"])
+        self.assertFalse(hasattr(x, "status_code"))
+        with self.assertRaises(MundoSMSError) as e:
+            api.post("/whatsapp/messages", {"to": "1"})
+        self.assertEqual([e.exception.http, e.exception.code, e.exception.data], [200, "whatsapp_rejected", {"id": "wam-1"}])
+        with self.assertRaises(MundoSMSError) as e:
+            api.get("/calls")
+        self.assertEqual([e.exception.http, e.exception.code, e.exception.message, e.exception.response], [502, None, "HTTP 502", None])
+        self.assertEqual(api.post("/whatsapp/messages", {"to": "1"})["data"]["state"], "unknown")   # el 202 no es un error
+        with self.assertRaises(MundoSMSError) as e:
+            api.get("/x")
+        self.assertIsNone(e.exception.code)
 
     def test_plazo(self):
         s = self.servidor(lambda n, p: (200, {"X-Lento": "1"}, OK))
@@ -190,10 +226,16 @@ class Pruebas(unittest.TestCase):
         self.assertTrue(s.peticiones[0]["firma"])
 
     def test_delete_repetido(self):
-        no = {"status": "error", "status_code": "4", "message": "Speed dial not found"}
+        no = {"status": "error", "code": "not_found", "message": "Speed dial not found"}
         s = self.servidor(lambda n, p: "corta" if n == 1 else (404, {}, no))
         r = self.cliente(s, retries=1).delete("/speed-dials/9121")
-        self.assertEqual([r["status"], r["message"], r["data"]["changed"], len(s.peticiones)], ["success", "Already deleted", False, 2])
+        self.assertEqual(r, {"status": "success", "message": "Already deleted", "data": {"state": "deleted", "changed": False}})
+        self.assertEqual(len(s.peticiones), 2)
+        ruta = {"status": "error", "code": "route_not_found", "message": "Route not found"}   # tras el corte, una ruta que no existe es un error
+        s = self.servidor(lambda n, p: "corta" if n == 1 else (404, {}, ruta))
+        with self.assertRaises(MundoSMSError) as e:
+            self.cliente(s, retries=1).delete("/speed-dials/9121")
+        self.assertEqual([e.exception.http, e.exception.code], [404, "route_not_found"])
         s = self.servidor(lambda n, p: (404, {}, no))   # sin fallo de red antes, un 404 es un error
         with self.assertRaises(MundoSMSError) as e:
             self.cliente(s, retries=1).delete("/speed-dials/9121")
@@ -205,7 +247,7 @@ class Pruebas(unittest.TestCase):
                 return 200, {}, {"status": "success", "data": {"results": 0, "calls": [], "has_more": False, "next_cursor": None}}
             if p["ruta"].startswith("/v3/una"):
                 return 200, {}, {"status": "success", "data": {"results": 1, "calls": [{"id": 1}], "has_more": False, "next_cursor": "u1"}}
-            return 400, {}, {"status": "error", "status_code": "3", "message": "Parameter cursor not valid"}
+            return 400, {}, {"status": "error", "code": "invalid_parameter", "message": "Parameter cursor not valid"}
         api = self.cliente(self.servidor(responde), retries=0)
         list(api.all("/vacia", {"cursor": "c9"}))
         self.assertEqual(api.last_cursor, "c9")

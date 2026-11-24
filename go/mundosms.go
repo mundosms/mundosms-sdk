@@ -24,20 +24,21 @@
 // como []any, los números como [json.Number] (sin perder cifras: n.Int64(), n.Float64() o n.String()), y además string,
 // bool y nil. Con [Response.Decode] lo pasas a tus propios tipos.
 //
-// Errores: un *[Error] con HTTP (el código HTTP), StatusCode ("3", "4"…), Message, Detail, Data, Response (la respuesta
-// entera) y RequestID (la cabecera X-Request-Id); se saca con errors.As. También cuando la API contesta con
+// Errores: un *[Error] con HTTP (el código HTTP), Code (la palabra de la API: "not_found", "invalid_parameter"…), Message,
+// Detail, Data, Response (la respuesta entera) y RequestID (la cabecera X-Request-Id); se saca con errors.As. También cuando la API contesta con
 // "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la
 // respuesta, con data["state"] "unknown". Lo que no se puede mandar (una Idempotency-Key mal formada, un cuerpo que no
 // se puede pasar a JSON) es un error que envuelve a [ErrInvalidArgument], y no se manda nada.
 //
 // Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
 // api.Post(ctx, path, data, mundosms.IdempotencyKey("pedido-881"))). Por eso un POST que falla por la red, o con 409
-// «Request in progress», se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera
+// request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera
 // vez, trae "idempotent_replayed": true ([Response.IdempotentReplayed]).
 //
 // Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un
-// POST con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After
-// (como mucho 60 s) o, si no lo trae, 1, 2, 4… s. El contexto corta la petición, los reintentos y las esperas. Un DELETE que
+// POST con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así
+// que repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera
+// lo que diga Retry-After (como mucho 60 s) o, si no lo trae, 1, 2, 4… s. El contexto corta la petición, los reintentos y las esperas. Un DELETE que
 // se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve como éxito, con data["changed"] false.
 //
 // Una redirección (3xx) no se sigue nunca: es un *[Error] (la API no redirige). Un 2xx que no es JSON (el HTML de un proxy
@@ -72,7 +73,7 @@ import (
 
 const (
 	// Version es la versión del SDK (va en la cabecera User-Agent).
-	Version = "1.2.0"
+	Version = "2.0.0"
 	// DefaultBaseURL es la dirección de la API.
 	DefaultBaseURL = "https://api.mundosms.es/v3"
 	// WebhookTolerance es lo más que puede alejarse de tu hora la «t» de la firma de un aviso.
@@ -97,7 +98,7 @@ var (
 // false, una lista separada por comas ([]string{"in", "out"} → in,out) y nil (y las listas vacías) no se mandan.
 type Params = map[string]any
 
-// Response es la respuesta entera, decodificada: status, status_code, message y data. Las rutas que devuelven un fichero
+// Response es la respuesta entera, decodificada: status, message y data. Las rutas que devuelven un fichero
 // (una grabación, una locución, el certificado de un SMS) no contestan JSON: vuelven como status "success", content_type
 // y body ([]byte, el contenido tal cual). Una respuesta vacía (un 204) vuelve igual, con body vacío.
 type Response map[string]any
@@ -139,14 +140,14 @@ func (r Response) Decode(v any) error {
 // Error es el error de cualquier petición: un 4xx o un 5xx, una respuesta 2xx con "status": "error" o, sin respuesta (la
 // red, el plazo agotado o el contexto cancelado), HTTP 0 y un Message que empieza por «No response from the API:».
 type Error struct {
-	HTTP       int            // el código HTTP; 0 si no hubo respuesta
-	StatusCode string         // el status_code de la API, como texto ("3", "4", "12"…); "" si la respuesta no era JSON
-	Message    string         // el message de la API ("Call not found"…) o el del SDK
-	Detail     string         // el detail de la respuesta, si lo trae
-	Data       map[string]any // el data de la respuesta (en WhatsApp, el id del mensaje que puede haber salido)
-	Response   map[string]any // la respuesta entera, decodificada; nil si no era JSON
-	RequestID  string         // la cabecera X-Request-Id: con ella encuentras la petición en Logs API
-	cause      error          // sin respuesta: la causa (la red, el plazo o el contexto)
+	HTTP      int            // el código HTTP; 0 si no hubo respuesta
+	Code      string         // el code de la API ("not_found", "invalid_parameter"…); "" si la respuesta no lo trae
+	Message   string         // el message de la API ("Call not found"…) o el del SDK
+	Detail    string         // el detail de la respuesta, si lo trae
+	Data      map[string]any // el data de la respuesta (en WhatsApp, el id del mensaje que puede haber salido)
+	Response  map[string]any // la respuesta entera, decodificada; nil si no era JSON
+	RequestID string         // la cabecera X-Request-Id: con ella encuentras la petición en Logs API
+	cause     error          // sin respuesta: la causa (la red, el plazo o el contexto)
 }
 
 func (e *Error) Error() string {
@@ -156,8 +157,8 @@ func (e *Error) Error() string {
 	}
 	if e.HTTP != 0 {
 		s += " (HTTP " + strconv.Itoa(e.HTTP)
-		if e.StatusCode != "" {
-			s += ", status_code " + e.StatusCode
+		if e.Code != "" {
+			s += ", code " + e.Code
 		}
 		s += ")"
 	}
@@ -387,7 +388,7 @@ func (c *Client) All(ctx context.Context, path string, query Params) func(yield 
 			data := r.Data()
 			cursor := text(data["next_cursor"])
 			if truthy(data["has_more"]) && truthy(data["results"]) && cursor == "" {
-				yield(nil, &Error{HTTP: 200, StatusCode: text(r["status_code"]), Response: r, Data: data,
+				yield(nil, &Error{HTTP: 200, Response: r, Data: data,
 					Message: "all() cannot go through " + path + ": it has more (has_more) but no next_cursor, so the list is not " +
 						"paginated: raise limit or narrow the filters, and read it with Get"})
 				return
@@ -511,10 +512,9 @@ func (c *Client) setRateLimit(h http.Header) {
 // fileTypes es lo que la API da como fichero (grabaciones, locuciones, diagramas y el PDF de un certificado).
 var fileTypes = regexp.MustCompile(`^(audio/|image/|application/pdf$|application/octet-stream$)`)
 
-// duplicated: un 409 «Duplicated request», la MISMA petición firmada llegó dos veces (la repitió algo entre medias).
+// duplicated: un 409 duplicated_request, la MISMA petición firmada llegó dos veces (la repitió algo entre medias).
 func duplicated(status int, j map[string]any) bool {
-	m, _ := j["message"].(string)
-	return status == 409 && strings.HasPrefix(m, "Duplicated request")
+	return status == 409 && text(j["code"]) == "duplicated_request"
 }
 
 // result es lo que devuelve un intento: la respuesta, o el *Error (también sin respuesta, la red o el plazo). afterNetwork:
@@ -558,9 +558,9 @@ func result(method string, afterNetwork bool, status int, header http.Header, re
 			return Response(j), nil
 		}
 	}
-	if m, _ := j["message"].(string); method == http.MethodDelete && afterNetwork && status == 404 && isJSON && !strings.HasPrefix(m, "Route not found") {
+	if method == http.MethodDelete && afterNetwork && status == 404 && isJSON && text(j["code"]) != "route_not_found" {
 		// lo borró el intento que se quedó sin respuesta
-		return Response{"status": "success", "status_code": "0", "message": "Already deleted",
+		return Response{"status": "success", "message": "Already deleted",
 			"data": map[string]any{"state": "deleted", "changed": false}}, nil
 	}
 	e := &Error{HTTP: status, Message: "HTTP " + strconv.Itoa(status), RequestID: header.Get("X-Request-Id")}
@@ -569,7 +569,7 @@ func result(method string, afterNetwork bool, status int, header http.Header, re
 		if m, ok := j["message"].(string); ok {
 			e.Message = m
 		}
-		e.StatusCode, e.Detail, e.Response = text(j["status_code"]), text(j["detail"]), j
+		e.Code, e.Detail, e.Response = text(j["code"]), text(j["detail"]), j
 		e.Data, _ = j["data"].(map[string]any)
 	}
 	return nil, e
@@ -629,7 +629,7 @@ func (c *Client) send(ctx context.Context, method, target, signedPath, ts, idemK
 
 // timestamp es el X-Timestamp de una petición, en milisegundos y siempre mayor que el de la anterior de este proceso: dos
 // peticiones iguales (un reintento inmediato, o dos goroutines a la vez, también desde dos clientes) nunca firman igual, y
-// la API no las toma por una repetida («409 Duplicated request»).
+// la API no las toma por una repetida («409 duplicated_request»).
 func timestamp() string {
 	tsMu.Lock()
 	defer tsMu.Unlock()
@@ -673,15 +673,15 @@ func idempotencyKey(opts []RequestOption, method string) (string, error) {
 }
 
 // retryable dice si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un
-// DELETE, ante un fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 «Request in progress». Un
-// 5xx de un POST no: la API no guarda los 5xx y repetirlo lo haría otra vez. Un 409 «Duplicated request» (la MISMA
-// petición firmada llegó dos veces: la repitió algo entre medias, como hace el Transport de Go con una conexión que se
-// cerró) es un fallo de red más.
+// DELETE, ante un fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un
+// 5xx de un POST no: un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un
+// 503 no hizo nada, pero repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición
+// firmada llegó dos veces: la repitió algo entre medias, como hace el Transport de Go con una conexión que se cerró) es un
+// fallo de red más.
 func retryable(method string, network bool, status int, j map[string]any, idemKey string) bool {
 	if status == 429 {
 		return true
 	}
-	message, _ := j["message"].(string)
 	network = network || duplicated(status, j)
 	switch {
 	case method == http.MethodGet:
@@ -689,7 +689,7 @@ func retryable(method string, network bool, status int, j map[string]any, idemKe
 	case method == http.MethodPatch || method == http.MethodDelete:
 		return network
 	case idemKey != "":
-		return network || (status == 409 && message == "Request in progress")
+		return network || (status == 409 && text(j["code"]) == "request_in_progress")
 	}
 	return false
 }

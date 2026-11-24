@@ -10,17 +10,18 @@
  *   echo $r["data"]["id"];
  *   foreach ($api->all("/calls", ["from_datetime" => "2026-11-01", "stop_at_ongoing" => true]) as $call) { ... }
  *
- * Errores: excepción MundoSMSError con ->http (código HTTP), ->statusCode ("3", "4"…), getMessage(), ->detail, ->data,
- * ->response (la respuesta entera) y ->requestId (la cabecera X-Request-Id). También cuando la API contesta con
- * "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta,
+ * Errores: excepción MundoSMSError con ->http (código HTTP), ->code (la palabra de la API: "not_found", "invalid_parameter"…;
+ * también getCode()), getMessage(), ->detail, ->data, ->response (la respuesta entera) y ->requestId (la cabecera
+ * X-Request-Id). También cuando la API contesta con "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta,
  * con data["state"] "unknown".
  * Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
- * $api->post($path, $data, ["idempotencyKey" => "pedido-881"])). Por eso un POST que falla por la red, o con 409 «Request
- * in progress», se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
+ * $api->post($path, $data, ["idempotencyKey" => "pedido-881"])). Por eso un POST que falla por la red, o con 409
+ * request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
  * "idempotent_replayed" => true.
  * Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
- * con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como mucho
- * 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
+ * con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
+ * repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
+ * diga Retry-After (como mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
  * como éxito, con data["changed"] false.
  * Una redirección (3xx) no se sigue nunca: es un MundoSMSError (la API no redirige). Un 2xx que no es JSON (el HTML de un
  * proxy o de un portal cautivo) también es un error; los ficheros que da la API (audio, imagen, PDF) vuelven por su
@@ -32,8 +33,8 @@ class MundoSMSError extends Exception
 {
     /** @var int el código HTTP; 0 si no hubo respuesta */
     public $http;
-    /** @var string|null el status_code de la API, como texto ("3", "4", "12"…) */
-    public $statusCode;
+    /** @var string|null el code de la API ("not_found", "invalid_parameter"…); null si la respuesta no lo trae */
+    public $code;
     /** @var string|null el detail de la respuesta, si lo trae */
     public $detail;
     /** @var array|null la respuesta entera, decodificada; null si no era JSON */
@@ -43,11 +44,11 @@ class MundoSMSError extends Exception
     /** @var string|null la cabecera X-Request-Id: con ella encuentras la petición en Logs API */
     public $requestId;
 
-    public function __construct($message, $http = 0, $statusCode = null, $detail = null, $response = null, $data = null, $requestId = null)
+    public function __construct($message, $http = 0, $code = null, $detail = null, $response = null, $data = null, $requestId = null)
     {
         parent::__construct((string) $message);
         $this->http = (int) $http;
-        $this->statusCode = $statusCode;
+        $this->code = $code;
         $this->detail = $detail;
         $this->response = $response;
         $this->data = $data;
@@ -57,7 +58,7 @@ class MundoSMSError extends Exception
 
 class MundoSMS
 {
-    const VERSION = "1.2.0";
+    const VERSION = "2.0.0";
     const MAX_RETRY_WAIT = 60;      // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
     const WEBHOOK_TOLERANCE = 300;  // segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
     const NOT_PAGINATED = "MundoSMS: all() cannot go through %s: it has more (has_more) but no next_cursor, so the list is not paginated: raise limit or narrow the filters, and read it with get()";
@@ -182,7 +183,7 @@ class MundoSMS
             $data = is_array($r["data"] ?? null) ? $r["data"] : array();
             $cursor = $data["next_cursor"] ?? null;
             if (!empty($data["has_more"]) && !empty($data["results"]) && ($cursor === null || $cursor === "")) {
-                throw new MundoSMSError(sprintf(self::NOT_PAGINATED, $path), 200, $r["status_code"] ?? null, null, $r, $data);
+                throw new MundoSMSError(sprintf(self::NOT_PAGINATED, $path), 200, null, null, $r, $data);
             }
             if ($listKey === null) {   // la lista es el primer campo con elementos: un objeto vacío ({}) también llega como array()
                 foreach ($data as $k => $v) if (is_array($v) && $v && self::isList($v)) { $listKey = $k; break; }
@@ -295,14 +296,12 @@ class MundoSMS
                 }
                 if (($j["status"] ?? null) !== "error") return $j;
             }
-            if ($method === "DELETE" && $afterNetwork && $http === 404 && is_array($j)
-                && strncmp((string) ($j["message"] ?? ""), "Route not found", 15) !== 0) {
+            if ($method === "DELETE" && $afterNetwork && $http === 404 && is_array($j) && self::code($j) !== "route_not_found") {
                 // lo borró el intento que se quedó sin respuesta
-                return array("status" => "success", "status_code" => "0", "message" => "Already deleted",
-                             "data" => array("state" => "deleted", "changed" => false));
+                return array("status" => "success", "message" => "Already deleted", "data" => array("state" => "deleted", "changed" => false));
             }
             throw new MundoSMSError(is_array($j) ? (string) ($j["message"] ?? "Error") : "HTTP " . $http, $http,
-                                    is_array($j) ? ($j["status_code"] ?? null) : null, is_array($j) ? ($j["detail"] ?? null) : null, $j,
+                                    is_array($j) ? self::code($j) : null, is_array($j) ? ($j["detail"] ?? null) : null, $j,
                                     is_array($j) ? ($j["data"] ?? null) : null, $rid);
         }
     }
@@ -355,7 +354,7 @@ class MundoSMS
     /**
      * El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso. Un reintento que sale
      * en el mismo milisegundo (un 429 con Retry-After: 0) firmaría igual que el intento de antes, y la API lo rechazaría por
-     * repetido («409 Duplicated request»).
+     * repetido («409 duplicated_request»).
      */
     private static function timestamp()
     {
@@ -386,25 +385,32 @@ class MundoSMS
 
     /**
      * Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un
-     * fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 «Request in progress». Un 5xx de un POST
-     * no: la API no guarda los 5xx y repetirlo lo haría otra vez. Un 409 «Duplicated request» (la MISMA petición firmada llegó
+     * fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST
+     * no: un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo
+     * nada, pero repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó
      * dos veces: la repitió algo entre medias, como hace curl con una conexión que se cerró) es un fallo de red más.
      */
     private static function retryable($method, $network, $http, $j, $idemKey)
     {
         if ($http === 429) return true;
-        $message = (is_array($j) && is_string($j["message"] ?? null)) ? $j["message"] : null;
         $network = $network || self::duplicated($http, $j);
         if ($method === "GET") return $network || $http >= 500;
         if ($method === "PATCH" || $method === "DELETE") return $network;
-        if ($idemKey !== null) return $network || ($http === 409 && $message === "Request in progress");
+        if ($idemKey !== null) return $network || ($http === 409 && self::code($j) === "request_in_progress");
         return false;
     }
 
-    /** 409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
+    /** 409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
     private static function duplicated($http, $j)
     {
-        return $http === 409 && is_array($j) && is_string($j["message"] ?? null) && strncmp($j["message"], "Duplicated request", 18) === 0;
+        return $http === 409 && self::code($j) === "duplicated_request";
+    }
+
+    /** El code de una respuesta de error ("duplicated_request"…) como texto, o null si no lo trae. */
+    private static function code($j)
+    {
+        if (!is_array($j) || !isset($j["code"])) return null;
+        return is_string($j["code"]) ? $j["code"] : json_encode($j["code"], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
     /** El cupo de la respuesta (X-RateLimit-Limit, -Remaining y -Reset, en enteros), o null si no lo trae. */

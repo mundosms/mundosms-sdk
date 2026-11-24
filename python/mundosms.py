@@ -9,17 +9,18 @@ Código y versiones: https://github.com/mundosms/mundosms-sdk (licencia MIT)
     for call in api.all("/calls", {"from_datetime": "2026-11-01", "stop_at_ongoing": True}):
         ...
 
-Errores: excepción MundoSMSError con .http (código HTTP), .status_code ("3", "4"…), .message (también str(e)), .detail,
-.data, .response (la respuesta entera) y .request_id (la cabecera X-Request-Id). También cuando la API contesta con
-"status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta,
+Errores: excepción MundoSMSError con .http (código HTTP), .code (la palabra de la API: "not_found", "invalid_parameter"…),
+.message (también str(e)), .detail, .data, .response (la respuesta entera) y .request_id (la cabecera X-Request-Id). También
+cuando la API contesta con "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta,
 con data["state"] "unknown".
 Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
-post(path, data, idempotency_key="pedido-881")). Por eso un POST que falla por la red, o con 409 «Request in progress», se
+post(path, data, idempotency_key="pedido-881")). Por eso un POST que falla por la red, o con 409 request_in_progress, se
 repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
 "idempotent_replayed": True.
 Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
-con 5xx no se repite: la API no guarda los 5xx, y repetirlo lo haría otra vez). Espera lo que diga Retry-After (como mucho
-60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
+con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
+repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
+diga Retry-After (como mucho 60 s) o, si no lo trae, 1, 2, 4… s. Un DELETE que se repite tras quedarse sin respuesta y da 404 ya estaba hecho: vuelve
 como éxito, con data["changed"] False.
 Una redirección (3xx) no se sigue nunca: es un MundoSMSError (la API no redirige, y seguirla llevaría tu token y tu firma a
 otro servidor). Un 2xx que no es JSON (el HTML de un proxy o de un portal cautivo) también es un error; los ficheros que da
@@ -41,7 +42,7 @@ import urllib.parse
 import urllib.request
 from email.utils import parsedate_to_datetime
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 MAX_RETRY_WAIT = 60      # segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
 WEBHOOK_TOLERANCE = 300  # segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
 _IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,64}")   # la forma que exige la API para la Idempotency-Key
@@ -53,18 +54,18 @@ class MundoSMSError(Exception):
     """El error de cualquier petición: un 4xx o un 5xx, una respuesta 2xx con "status": "error" o, sin respuesta (la red o
     el plazo agotado), http 0 y un mensaje que empieza por «No response from the API:»."""
 
-    def __init__(self, message, http=0, status_code=None, detail=None, response=None, data=None, request_id=None):
+    def __init__(self, message, http=0, code=None, detail=None, response=None, data=None, request_id=None):
         super().__init__(message)
         self.message = message           # el message de la API ("Call not found"…) o el del SDK
         self.http = http                 # el código HTTP; 0 si no hubo respuesta
-        self.status_code = status_code   # el status_code de la API, como texto ("3", "4", "12"…)
+        self.code = code                 # el code de la API ("not_found", "invalid_parameter"…); None si la respuesta no lo trae
         self.detail = detail             # el detail de la respuesta, si lo trae
         self.response = response         # la respuesta entera, decodificada; None si no era JSON
         self.data = data                 # el data de la respuesta (en WhatsApp, el id del mensaje que puede haber salido)
         self.request_id = request_id     # la cabecera X-Request-Id: con ella encuentras la petición en Logs API
 
     def __reduce__(self):   # con pickle (Celery, multiprocessing), con todos sus campos y no solo el mensaje
-        return (self.__class__, (self.message, self.http, self.status_code, self.detail, self.response, self.data, self.request_id))
+        return (self.__class__, (self.message, self.http, self.code, self.detail, self.response, self.data, self.request_id))
 
 
 class MundoSMS:
@@ -129,7 +130,7 @@ class MundoSMS:
             data = r.get("data") if isinstance(r.get("data"), dict) else {}
             cursor = data.get("next_cursor")
             if data.get("has_more") and data.get("results") and not cursor:
-                raise MundoSMSError(_NOT_PAGINATED % path, 200, r.get("status_code"), None, r, data)
+                raise MundoSMSError(_NOT_PAGINATED % path, 200, None, None, r, data)
             if list_key is None:
                 list_key = next((k for k, v in data.items() if isinstance(v, list)), None)
             for item in (data.get(list_key) or []) if list_key else []:
@@ -228,10 +229,10 @@ class MundoSMS:
                     return file
                 if j.get("status") != "error":
                     return j
-            if method == "DELETE" and after_network and http_ == 404 and j is not None and not str(j.get("message", "")).startswith("Route not found"):
+            if method == "DELETE" and after_network and http_ == 404 and j is not None and j.get("code") != "route_not_found":
                 return _already_deleted()   # lo borró el intento que se quedó sin respuesta
             if j is not None:
-                raise MundoSMSError(j.get("message", "Error"), http_, j.get("status_code"), j.get("detail"), j, j.get("data"), rid)
+                raise MundoSMSError(j.get("message", "Error"), http_, _text(j.get("code")), j.get("detail"), j, j.get("data"), rid)
             raise MundoSMSError("HTTP %d" % http_, http_, request_id=rid)
 
     @staticmethod
@@ -300,14 +301,26 @@ def _redirected(http_, location):
     return "HTTP %d: redirect%s not followed (the API does not redirect: check base_url)" % (http_, where)
 
 
+def _code(j):
+    """El code de una respuesta de error ("duplicated_request"…), o None si no lo trae."""
+    return j.get("code") if isinstance(j, dict) else None
+
+
+def _text(v):
+    """Un valor de la respuesta como texto (el code), o None si no viene."""
+    if v is None:
+        return None
+    return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+
 def _duplicated(http_, j):
-    """409 «Duplicated request»: la MISMA petición firmada llegó dos veces (la repitió algo entre medias)."""
-    return http_ == 409 and j is not None and str(j.get("message", "")).startswith("Duplicated request")
+    """409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias)."""
+    return http_ == 409 and _code(j) == "duplicated_request"
 
 
 def _already_deleted():
     """La respuesta de un DELETE que se repitió tras quedarse sin respuesta y dio 404: lo borró el primer intento."""
-    return {"status": "success", "status_code": "0", "message": "Already deleted", "data": {"state": "deleted", "changed": False}}
+    return {"status": "success", "message": "Already deleted", "data": {"state": "deleted", "changed": False}}
 
 
 def _rate_limit(headers):
@@ -325,7 +338,7 @@ def _rate_limit(headers):
 def _timestamp():
     """El X-Timestamp de una petición: milisegundos, y siempre mayor que el de la anterior de este proceso (también desde varios
     hilos). Dos peticiones iguales en el mismo milisegundo (un reintento tras un 429 con Retry-After: 0, o dos a la vez)
-    firmarían igual, y la API rechazaría la segunda por repetida («409 Duplicated request»)."""
+    firmarían igual, y la API rechazaría la segunda por repetida («409 duplicated_request»)."""
     global _last_timestamp
     with _timestamp_lock:
         _last_timestamp = max(int(time.time() * 1000), _last_timestamp + 1)
@@ -343,19 +356,19 @@ def _idempotency_key(key, method):
 
 def _retryable(method, network, http_, j, idem_key):
     """Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un
-    fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 «Request in progress». Un 5xx de un POST no:
-    la API no guarda los 5xx y repetirlo lo haría otra vez. Un 409 «Duplicated request» (la MISMA petición firmada llegó dos
-    veces: la repitió algo entre medias, como hace un cliente HTTP con una conexión que se cerró) es un fallo de red más."""
+    fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST no:
+    un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero
+    repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó dos veces:
+    la repitió algo entre medias, como hace un cliente HTTP con una conexión que se cerró) es un fallo de red más."""
     if http_ == 429:
         return True
-    message = j.get("message") if isinstance(j, dict) else None
     network = network or _duplicated(http_, j)
     if method == "GET":
         return network or http_ >= 500
     if method in ("PATCH", "DELETE"):
         return network
     if idem_key:
-        return network or (http_ == 409 and message == "Request in progress")
+        return network or (http_ == 409 and _code(j) == "request_in_progress")
     return False
 
 
