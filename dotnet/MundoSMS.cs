@@ -10,12 +10,18 @@
 //   foreach (var call in api.All("/calls", new { from_datetime = "2026-11-01", stop_at_ongoing = true })) { ... }
 //
 // Errores: excepción MundoSMSException con .Http (código HTTP), .Code (la palabra de la API: "not_found", "invalid_parameter"…),
-// .Message, .Detail, .Data, .Response (la respuesta entera) y .RequestId (la cabecera X-Request-Id). También cuando la API contesta con "status": "error", venga con el código HTTP que
-// venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta, con data.state "unknown".
+// .Message, .Detail, .Data, .Response (la respuesta entera), .RequestId (la cabecera X-Request-Id) e .IdempotencyKey (la
+// Idempotency-Key que llevó la petición: la de un POST, para repetirlo tú con la misma). También cuando la API contesta con
+// "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta,
+// con data.state "unknown".
 // Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
 // api.PostAsync(path, data, new MundoSMSRequestOptions { IdempotencyKey = "pedido-881" })). Por eso un POST que falla por
 // la red, o con 409 request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de
 // la primera vez, r.IdempotentReplayed es true (y r["idempotent_replayed"] también).
+// Un 409 request_in_progress (la primera petición con esa clave aún se está haciendo: un WhatsApp con un fichero puede tardar
+// 2 o 3 minutos) se repite con la misma clave hasta 180 s desde el primero, sin contar en Retries: espera lo que diga
+// Retry-After (al menos 1 s) o 1, 2, 4, 8 y luego 15 s. Si Retry-After pide más de lo que queda, o se acaban los 180 s, es una
+// MundoSMSException con su .IdempotencyKey: repítelo más tarde con ella. Con Retries = 0, no se repite.
 // Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
 // con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
 // repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
@@ -94,6 +100,13 @@ namespace MundoSMS
 
         /// <summary>La cabecera <c>X-Request-Id</c> de la respuesta: con ella encuentras la petición en Logs API.</summary>
         public string RequestId { get; private set; }
+
+        /// <summary>
+        /// La <c>Idempotency-Key</c> que llevó la petición (la de un POST: la tuya, o la que puso el SDK); null si no llevó (un
+        /// GET, un PATCH o un DELETE sin clave). Con ella repites el POST sin que se haga dos veces: tras un 409
+        /// request_in_progress que no terminó a tiempo, o sin respuesta.
+        /// </summary>
+        public string IdempotencyKey { get; internal set; }
 
         /// <summary>La respuesta entera, decodificada; null si no era JSON.</summary>
         public Dictionary<string, object> Response { get; private set; }
@@ -193,12 +206,14 @@ namespace MundoSMS
     public class MundoSMSClient
     {
         /// <summary>La versión del SDK.</summary>
-        public const string Version = "2.0.0";
+        public const string Version = "2.1.0";
 
         /// <summary>Los segundos que puede alejarse de tu hora la «t» de la firma de un aviso, si no dices otra cosa.</summary>
         public const long WebhookTolerance = 300;
 
         private const double MaxRetryDelay = 60;   // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
+        private const double InProgressWait = 180;   // segundos: lo más que se espera, con la misma Idempotency-Key, a un POST que sigue en marcha (409 request_in_progress)
+        private const double InProgressStep = 15;    // segundos: lo más que se espera entre dos intentos de ese POST si la API no manda Retry-After
 
         private static readonly Lazy<HttpClient> SharedHttpClient = new Lazy<HttpClient>(CreateHttpClient);
         private static long lastTimestamp;   // el X-Timestamp de la última petición de este proceso (milisegundos)
@@ -572,6 +587,8 @@ namespace MundoSMS
             var httpMethod = new HttpMethod(method);
             TimeSpan limit = timeout;
             bool afterNetwork = false;   // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
+            int inProgress = 0;          // cuántos 409 request_in_progress lleva esta llamada
+            System.Diagnostics.Stopwatch inProgressClock = null;   // desde el primero
             for (int attempt = 1; ; attempt++)
             {
                 int httpStatus = 0;
@@ -632,7 +649,18 @@ namespace MundoSMS
                 bool redirect = networkError == null && (redirectedTo != null || (httpStatus >= 300 && httpStatus < 400));
                 object parsed;
                 var obj = networkError == null && !redirect && Json.TryParse(responseBody, out parsed) ? parsed as Dictionary<string, object> : null;
-                if (!redirect && IsRetryable(method, networkError != null, httpStatus, obj, idempotencyKey) && attempt <= retries)
+                if (!redirect && retries > 0 && IsInProgress(method, httpStatus, obj, idempotencyKey))
+                {
+                    if (inProgress++ == 0) inProgressClock = System.Diagnostics.Stopwatch.StartNew();
+                    double? wait = InProgressDelay(retryAfter, inProgress, InProgressWait - inProgressClock.Elapsed.TotalSeconds);
+                    if (wait.HasValue)   // la primera con esta clave sigue en marcha: se espera y se repite, sin gastar Retries
+                    {
+                        attempt--;
+                        await Task.Delay(TimeSpan.FromSeconds(wait.Value), cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+                }
+                else if (!redirect && IsRetryable(method, networkError != null, httpStatus, obj, idempotencyKey) && attempt <= retries)
                 {
                     afterNetwork = afterNetwork || networkError != null || IsDuplicated(httpStatus, obj);
                     await Task.Delay(RetryDelay(retryAfter, attempt), cancellationToken).ConfigureAwait(false);
@@ -641,7 +669,7 @@ namespace MundoSMS
                 if (networkError != null)
                 {
                     LastRateLimit = null;
-                    throw new MundoSMSException("No response from the API: " + networkError, networkException);
+                    throw new MundoSMSException("No response from the API: " + networkError, networkException) { IdempotencyKey = idempotencyKey };
                 }
                 LastRateLimit = rateLimit;
                 if (redirect)   // no se sigue: llevaría la firma y los datos a otro servidor
@@ -651,7 +679,7 @@ namespace MundoSMS
                     throw new MundoSMSException("HTTP " + httpStatus.ToString(CultureInfo.InvariantCulture) + ": redirect" + (to.Length > 0 ? " to " + to : "") +
                                                 " not followed (the API does not redirect: check BaseUrl" +
                                                 (redirectedTo != null ? ", and create your HttpClient with AllowAutoRedirect = false" : "") + ")",
-                                                httpStatus, null, null, null, null, requestId);
+                                                httpStatus, null, null, null, null, requestId) { IdempotencyKey = idempotencyKey };
                 }
                 if (replayed && obj != null) obj["idempotent_replayed"] = true;   // la respuesta guardada de la primera vez
                 if (httpStatus >= 200 && httpStatus < 300)
@@ -662,7 +690,8 @@ namespace MundoSMS
                         string type = contentType.Split(';')[0].Trim();
                         if (responseBody != null && responseBody.Length > 0 && !IsFileType(type))
                             throw new MundoSMSException("HTTP " + httpStatus.ToString(CultureInfo.InvariantCulture) + ": the response is not JSON (" +
-                                                        (type.Length > 0 ? type : "no Content-Type") + ")", httpStatus, null, null, null, null, requestId);
+                                                        (type.Length > 0 ? type : "no Content-Type") + ")", httpStatus, null, null, null, null, requestId)
+                                  { IdempotencyKey = idempotencyKey };
                         result.Body = responseBody;
                         result["status"] = "success";
                         result["content_type"] = contentType;
@@ -694,19 +723,20 @@ namespace MundoSMS
                     obj.TryGetValue("data", out dataValue);
                     throw new MundoSMSException(messageValue == null ? "Error" : ToText(messageValue), httpStatus, ApiCode(obj),
                                                 detailValue == null ? null : ToText(detailValue), obj,
-                                                dataValue as Dictionary<string, object>, requestId);
+                                                dataValue as Dictionary<string, object>, requestId) { IdempotencyKey = idempotencyKey };
                 }
-                throw new MundoSMSException("HTTP " + httpStatus.ToString(CultureInfo.InvariantCulture), httpStatus, null, null, null, null, requestId);
+                throw new MundoSMSException("HTTP " + httpStatus.ToString(CultureInfo.InvariantCulture), httpStatus, null, null, null, null, requestId)
+                      { IdempotencyKey = idempotencyKey };
             }
         }
 
         /// <summary>
-        /// Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un
-        /// fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST
-        /// no: un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo
-        /// nada, pero repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada
-        /// llegó dos veces: la repitió algo entre medias, como hace HttpClient con una conexión reutilizada que se cerró) es un
-        /// fallo de red más.
+        /// Si se puede repetir (hasta Retries veces): un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH,
+        /// un DELETE o un POST con su Idempotency-Key, ante un fallo de red. Un 5xx de un POST no: un 500 puede haberse hecho y la
+        /// API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero repetirlo con la misma
+        /// clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó dos veces: la repitió algo entre
+        /// medias, como hace HttpClient con una conexión reutilizada que se cerró) es un fallo de red más. El 409
+        /// request_in_progress va aparte (IsInProgress): se espera por tiempo, no por intentos.
         /// </summary>
         private static bool IsRetryable(string method, bool network, int httpStatus, Dictionary<string, object> json, string idempotencyKey)
         {
@@ -714,8 +744,28 @@ namespace MundoSMS
             network = network || IsDuplicated(httpStatus, json);
             if (method == "GET") return network || httpStatus >= 500;
             if (method == "PATCH" || method == "DELETE") return network;
-            if (idempotencyKey != null) return network || (httpStatus == 409 && ApiCode(json) == "request_in_progress");
+            if (idempotencyKey != null) return network;
             return false;
+        }
+
+        /// <summary>409 request_in_progress en un POST con su Idempotency-Key: la primera petición con esa clave aún no ha terminado.</summary>
+        private static bool IsInProgress(string method, int httpStatus, Dictionary<string, object> json, string idempotencyKey)
+        {
+            return method == "POST" && idempotencyKey != null && httpStatus == 409 && ApiCode(json) == "request_in_progress";
+        }
+
+        /// <summary>
+        /// Segundos antes de repetir, con la misma clave, un POST que sigue en marcha (tras su n-ésimo 409 request_in_progress), o
+        /// null si ya no se espera: lo que pida Retry-After (al menos 1 s y como mucho 60) o, sin él, 1, 2, 4, 8 y luego 15.
+        /// <paramref name="remaining"/>: lo que queda de los 180 s. Si Retry-After pide más, o la espera no cabe, null.
+        /// </summary>
+        private static double? InProgressDelay(string retryAfter, int n, double remaining)
+        {
+            double seconds = RetryAfterSeconds(retryAfter);
+            if (double.IsNaN(seconds)) seconds = Math.Min(Math.Pow(2, n - 1), InProgressStep);
+            else if (seconds > remaining) return null;
+            seconds = Math.Max(1, Math.Min(MaxRetryDelay, seconds));
+            return seconds <= remaining ? seconds : (double?)null;
         }
 
         /// <summary>409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias).</summary>
@@ -948,6 +998,14 @@ namespace MundoSMS
         /// <summary>Antes del siguiente intento: lo que pida Retry-After (segundos o fecha HTTP), o 1, 2, 4… s. Como mucho 60.</summary>
         private static TimeSpan RetryDelay(string retryAfter, int attempt)
         {
+            double seconds = RetryAfterSeconds(retryAfter);
+            if (double.IsNaN(seconds)) seconds = Math.Pow(2, attempt - 1);   // sin cabecera, o no se entiende
+            return TimeSpan.FromSeconds(Math.Max(0, Math.Min(MaxRetryDelay, seconds)));
+        }
+
+        /// <summary>Los segundos que pide Retry-After (segundos o fecha HTTP), o NaN si no viene o no se entiende.</summary>
+        private static double RetryAfterSeconds(string retryAfter)
+        {
             double seconds = double.NaN;
             if (!string.IsNullOrEmpty(retryAfter))
             {
@@ -959,8 +1017,7 @@ namespace MundoSMS
                         ? (date - DateTimeOffset.UtcNow).TotalSeconds : double.NaN;
                 }
             }
-            if (double.IsNaN(seconds)) seconds = Math.Pow(2, attempt - 1);   // sin cabecera, o no se entiende
-            return TimeSpan.FromSeconds(Math.Max(0, Math.Min(MaxRetryDelay, seconds)));
+            return seconds;
         }
 
         private static string Seconds(TimeSpan t)

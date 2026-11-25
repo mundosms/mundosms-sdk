@@ -86,15 +86,46 @@ test("reintentos: un 429 sí; un POST con 5xx, no", async (t) => {
 });
 
 // un 409 se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con su
-// clave) se repiten; otro 409, aunque su message diga lo mismo, no
+// clave) se repiten; otro 409, aunque su message diga lo mismo, no (el POST con request_in_progress, con Retry-After de una hora:
+// más de lo que se espera, así que no se repite; lo que espera, en «un 409 request_in_progress»)
 test("un 409: por su code", async (t) => {
-  for (const [metodo, code, mensaje, n] of [["GET", "duplicated_request", "Duplicated request", 3], ["PATCH", "duplicated_request", "Duplicated request", 3],
-    ["POST", "duplicated_request", "Duplicated request", 3], ["POST", "request_in_progress", "Request in progress", 3],
-    ["PATCH", "request_in_progress", "Request in progress", 1], ["POST", "already_exists", "Request in progress", 1]]) {
-    const s = await servidor(t, () => [409, { "Retry-After": "0" }, { status: "error", code, message: mensaje }]);
+  for (const [metodo, code, mensaje, n, ra] of [["GET", "duplicated_request", "Duplicated request", 3, "0"], ["PATCH", "duplicated_request", "Duplicated request", 3, "0"],
+    ["POST", "duplicated_request", "Duplicated request", 3, "0"], ["POST", "request_in_progress", "Request in progress", 1, "3600"],
+    ["PATCH", "request_in_progress", "Request in progress", 1, "0"], ["POST", "already_exists", "Request in progress", 1, "0"]]) {
+    const s = await servidor(t, () => [409, { "Retry-After": ra }, { status: "error", code, message: mensaje }]);
     const e = await falla(() => cliente(s, { retries: 2 }).request(metodo, "/x", { a: 1 }));
     assert.deepStrictEqual([e.http, e.code, s.peticiones.length], [409, code, n], metodo + " " + code);
   }
+});
+
+// 2.1.0: un 409 request_in_progress se repite con la MISMA clave por tiempo (hasta 180 s), no por intentos
+test("un 409 request_in_progress: se espera con la misma clave", async (t) => {
+  const en = { status: "error", code: "request_in_progress", message: "Request in progress" };
+  // un corte (gasta el único reintento de retries 1) y tres 409 (Retry-After: 0, que se espera como 1 s); a la quinta, la respuesta
+  const s = await servidor(t, (n) => (n === 1 ? "corta" : n < 5 ? [409, { "Retry-After": "0" }, en] : [200, {}, OK]));
+  let t0 = Date.now();
+  assert.strictEqual((await cliente(s, { retries: 1 }).post("/whatsapp/messages", { to: "1" })).status, "success");
+  const claves = s.peticiones.map((x) => x.cabeceras["idempotency-key"]);
+  assert.deepStrictEqual([claves.length, new Set(claves).size, new Set(s.peticiones.map((x) => x.cabeceras["x-timestamp"])).size], [5, 1, 5]);
+  let d = (Date.now() - t0) / 1000;
+  assert.ok(d >= 3 && d < 8, String(d));
+  // sin Retry-After: 1 y 2 s
+  const s2 = await servidor(t, (n) => (n < 3 ? [409, {}, en] : [200, {}, OK]));
+  t0 = Date.now();
+  assert.strictEqual((await cliente(s2, { retries: 1 }).post("/sms", { to: "1" })).status, "success");
+  d = (Date.now() - t0) / 1000;
+  assert.strictEqual(s2.peticiones.length, 3);
+  assert.ok(d >= 3 && d < 6, String(d));
+  // Retry-After pide más de lo que queda de los 180 s: no espera; el error lleva la clave para repetirlo más tarde
+  const s3 = await servidor(t, () => [409, { "Retry-After": "3600" }, en]);
+  t0 = Date.now();
+  let e = await falla(() => cliente(s3, { retries: 1 }).post("/sms", { to: "1" }, { idempotencyKey: "pedido-881" }));
+  assert.deepStrictEqual([e.http, e.code, e.idempotencyKey, s3.peticiones.length], [409, "request_in_progress", "pedido-881", 1]);
+  assert.ok(Date.now() - t0 < 1000);
+  // con retries 0, ninguno; y la clave puesta por el SDK, en el error
+  const s4 = await servidor(t, () => [409, { "Retry-After": "0" }, en]);
+  e = await falla(() => cliente(s4, { retries: 0 }).post("/sms", { to: "1" }));
+  assert.deepStrictEqual([e.idempotencyKey, s4.peticiones.length], [s4.peticiones[0].cabeceras["idempotency-key"], 1]);
 });
 
 test("los campos del error", async (t) => {
@@ -105,10 +136,13 @@ test("los campos del error", async (t) => {
   const s = await servidor(t, (n) => r[n - 1]);
   const api = cliente(s, { retries: 0 });
   let e = await falla(() => api.get("/calls/out/999"));
-  assert.deepStrictEqual([e.http, e.code, e.message, e.detail, e.requestId, e.response.status], [404, "not_found", "Call not found", "no call 999", "req-1", "error"]);
+  assert.deepStrictEqual([e.http, e.code, e.message, e.detail, e.requestId, e.response.status, e.idempotencyKey],
+                         [404, "not_found", "Call not found", "no call 999", "req-1", "error", null]); // un GET no lleva clave
   assert.ok(!("statusCode" in e));
   e = await falla(() => api.post("/whatsapp/messages", { to: "1" }));
   assert.deepStrictEqual([e.http, e.code, e.data], [200, "whatsapp_rejected", { id: "wam-1" }]);
+  assert.match(e.idempotencyKey || "", /^[0-9a-f-]{36}$/); // 2.1.0: la Idempotency-Key que llevó el POST
+  assert.strictEqual(e.idempotencyKey, s.peticiones[1].cabeceras["idempotency-key"]);
   e = await falla(() => api.get("/calls"));
   assert.deepStrictEqual([e.http, e.code, e.message, e.response], [502, null, "HTTP 502", null]);
   assert.strictEqual((await api.post("/whatsapp/messages", { to: "1" })).data.state, "unknown"); // el 202 no es un error
@@ -120,6 +154,9 @@ test("el plazo es de la petición entera", async (t) => {
   const e = await falla(() => cliente(s, { timeout: 0.3, retries: 0 }).get("/calls"));
   assert.deepStrictEqual([e.http, e.message], [0, "No response from the API: timed out after 0.3 s"]);
   assert.ok(Date.now() - t0 < 1200);
+  // 2.1.0: sin respuesta, el error de un POST lleva la clave con la que repetirlo
+  const e2 = await falla(() => cliente(s, { timeout: 0.3, retries: 0 }).post("/sms", { to: "1" }, { idempotencyKey: "pedido-882" }));
+  assert.deepStrictEqual([e2.http, e2.idempotencyKey, e2.message.slice(0, 16)], [0, "pedido-882", "No response from"]);
 });
 
 test("all recorre las páginas con su cursor", async (t) => {

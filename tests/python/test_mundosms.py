@@ -135,14 +135,57 @@ class Pruebas(unittest.TestCase):
     def test_409(self):
         # se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con su
         # clave) se repiten; otro 409, aunque su message diga lo mismo, no
-        casos = [("GET", "duplicated_request", "Duplicated request", 3), ("PATCH", "duplicated_request", "Duplicated request", 3),
-                 ("POST", "duplicated_request", "Duplicated request", 3), ("POST", "request_in_progress", "Request in progress", 3),
-                 ("PATCH", "request_in_progress", "Request in progress", 1), ("POST", "already_exists", "Request in progress", 1)]
-        for metodo, code, mensaje, n in casos:
-            s = self.servidor(lambda _n, _p: (409, {"Retry-After": "0"}, {"status": "error", "code": code, "message": mensaje}))
+        # (el POST con request_in_progress, con Retry-After de una hora: más de lo que se espera, así que no se repite; lo que
+        # espera, en test_en_marcha)
+        casos = [("GET", "duplicated_request", "Duplicated request", 3, "0"), ("PATCH", "duplicated_request", "Duplicated request", 3, "0"),
+                 ("POST", "duplicated_request", "Duplicated request", 3, "0"), ("POST", "request_in_progress", "Request in progress", 1, "3600"),
+                 ("PATCH", "request_in_progress", "Request in progress", 1, "0"), ("POST", "already_exists", "Request in progress", 1, "0")]
+        for metodo, code, mensaje, n, ra in casos:
+            s = self.servidor(lambda _n, _p: (409, {"Retry-After": ra}, {"status": "error", "code": code, "message": mensaje}))
             with self.assertRaises(MundoSMSError) as e:
                 self.cliente(s, retries=2).request(metodo, "/x", {"a": 1})
             self.assertEqual([e.exception.http, e.exception.code, len(s.peticiones)], [409, code, n], (metodo, code))
+
+    def test_en_marcha(self):
+        # 2.1.0: un 409 request_in_progress se repite con la MISMA clave por tiempo (hasta 180 s), no por intentos: aquí, un corte
+        # (gasta el único reintento de retries=1) y tres 409 (Retry-After: 0, que se espera como 1 s), y a la quinta, la respuesta
+        en = (409, {"Retry-After": "0"}, {"status": "error", "code": "request_in_progress", "message": "Request in progress"})
+        s = self.servidor(lambda n, p: "corta" if n == 1 else (en if n < 5 else (200, {}, OK)))
+        t0 = time.time()
+        self.assertEqual(self.cliente(s, retries=1).post("/whatsapp/messages", {"to": "1"})["status"], "success")
+        claves = [x["cabeceras"]["Idempotency-Key"] for x in s.peticiones]
+        self.assertEqual([len(claves), len(set(claves)), len({x["cabeceras"]["X-Timestamp"] for x in s.peticiones})], [5, 1, 5])
+        self.assertTrue(3 <= time.time() - t0 < 8, time.time() - t0)
+        # sin Retry-After: 1 y 2 s
+        s = self.servidor(lambda n, p: (409, {}, en[2]) if n < 3 else (200, {}, OK))
+        t0 = time.time()
+        self.assertEqual(self.cliente(s, retries=1).post("/sms", {"to": "1"})["status"], "success")
+        self.assertEqual(len(s.peticiones), 3)
+        self.assertTrue(3 <= time.time() - t0 < 6, time.time() - t0)
+        # Retry-After pide más de lo que queda de los 180 s: no espera; el error lleva la clave para repetirlo más tarde
+        s = self.servidor(lambda n, p: (409, {"Retry-After": "3600"}, en[2]))
+        t0 = time.time()
+        with self.assertRaises(MundoSMSError) as e:
+            self.cliente(s, retries=1).post("/sms", {"to": "1"}, idempotency_key="pedido-881")
+        self.assertEqual([e.exception.http, e.exception.code, e.exception.idempotency_key, len(s.peticiones)],
+                         [409, "request_in_progress", "pedido-881", 1])
+        self.assertLess(time.time() - t0, 1)
+        # con retries=0, ninguno; y la clave puesta por el SDK, en el error
+        s = self.servidor(lambda n, p: en)
+        with self.assertRaises(MundoSMSError) as e:
+            self.cliente(s, retries=0).post("/sms", {"to": "1"})
+        self.assertEqual([e.exception.idempotency_key, len(s.peticiones)], [s.peticiones[0]["cabeceras"]["Idempotency-Key"], 1])
+        # el tope (aquí, 2,5 s en vez de 180): tras dos esperas de 1 s, la tercera no cabe
+        import mundosms
+        tope = mundosms.IN_PROGRESS_WAIT
+        mundosms.IN_PROGRESS_WAIT = 2.5
+        try:
+            s = self.servidor(lambda n, p: en)
+            with self.assertRaises(MundoSMSError) as e:
+                self.cliente(s).post("/sms", {"to": "1"})
+            self.assertEqual([e.exception.code, len(s.peticiones)], ["request_in_progress", 3])
+        finally:
+            mundosms.IN_PROGRESS_WAIT = tope
 
     def test_errores(self):
         r = [(404, {"X-Request-Id": "req-1"}, {"status": "error", "code": "not_found", "message": "Call not found", "detail": "no call 999"}),
@@ -150,16 +193,19 @@ class Pruebas(unittest.TestCase):
              (502, {"Content-Type": "text/html"}, b"<html>Bad gateway</html>"),
              (202, {}, {"status": "success", "message": "Not confirmed", "data": {"id": "wam-2", "state": "unknown"}}),
              (400, {}, {"status": "error", "message": "Sin code"})]
-        api = self.cliente(self.servidor(lambda n, p: r[n - 1]), retries=0)
+        srv = self.servidor(lambda n, p: r[n - 1])
+        api = self.cliente(srv, retries=0)
         with self.assertRaises(MundoSMSError) as e:
             api.get("/calls/out/999")
         x = e.exception
-        self.assertEqual([x.http, x.code, x.message, x.detail, x.request_id, x.response["status"]],
-                         [404, "not_found", "Call not found", "no call 999", "req-1", "error"])
+        self.assertEqual([x.http, x.code, x.message, x.detail, x.request_id, x.response["status"], x.idempotency_key],
+                         [404, "not_found", "Call not found", "no call 999", "req-1", "error", None])   # un GET no lleva clave
         self.assertFalse(hasattr(x, "status_code"))
         with self.assertRaises(MundoSMSError) as e:
             api.post("/whatsapp/messages", {"to": "1"})
         self.assertEqual([e.exception.http, e.exception.code, e.exception.data], [200, "whatsapp_rejected", {"id": "wam-1"}])
+        self.assertRegex(e.exception.idempotency_key or "", r"^[0-9a-f-]{36}$")   # 2.1.0: la Idempotency-Key que llevó el POST
+        self.assertEqual(e.exception.idempotency_key, srv.peticiones[1]["cabeceras"]["Idempotency-Key"])
         with self.assertRaises(MundoSMSError) as e:
             api.get("/calls")
         self.assertEqual([e.exception.http, e.exception.code, e.exception.message, e.exception.response], [502, None, "HTTP 502", None])
@@ -175,6 +221,12 @@ class Pruebas(unittest.TestCase):
             self.cliente(s, timeout=0.3, retries=0).get("/calls")
         self.assertEqual([e.exception.http, e.exception.message], [0, "No response from the API: timed out after 0.3 s"])
         self.assertLess(time.time() - t0, 1.2)
+        # 2.1.0: sin respuesta, el error de un POST lleva la clave con la que repetirlo (y pasa por pickle con ella)
+        with self.assertRaises(MundoSMSError) as e:
+            self.cliente(s, timeout=0.3, retries=0).post("/sms", {"to": "1"}, idempotency_key="pedido-882")
+        import pickle
+        x = pickle.loads(pickle.dumps(e.exception))
+        self.assertEqual([e.exception.http, e.exception.idempotency_key, x.idempotency_key, x.message[:16]], [0, "pedido-882", "pedido-882", "No response from"])
 
     def test_paginas(self):
         pags = [{"results": 2, "calls": [{"id": 1}, {"id": 2}], "has_more": True, "next_cursor": "a.2"},

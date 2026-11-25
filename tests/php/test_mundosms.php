@@ -142,16 +142,49 @@ plan(array(json(500, '{"status":"error","code":"internal_error","message":"Inter
 $e = error(function () { cliente()->post("/sms", array("to" => "1")); });
 ok($e && $e->http === 500 && $e->code === "internal_error" && count(peticiones()) === 1, "un POST con 5xx no se repite");
 // un 409 se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con su
-// clave) se repiten; otro 409, aunque su message diga lo mismo, no
-foreach (array(array("GET", "duplicated_request", "Duplicated request", 3), array("PATCH", "duplicated_request", "Duplicated request", 3),
-               array("POST", "duplicated_request", "Duplicated request", 3), array("POST", "request_in_progress", "Request in progress", 3),
-               array("PATCH", "request_in_progress", "Request in progress", 1), array("POST", "already_exists", "Request in progress", 1)) as $c) {
-    list($metodo, $code, $mensaje, $n) = $c;
-    $r409 = json(409, array("status" => "error", "code" => $code, "message" => $mensaje), array("Retry-After" => "0"));
+// clave) se repiten; otro 409, aunque su message diga lo mismo, no (el POST con request_in_progress, con Retry-After de una hora:
+// más de lo que se espera, así que no se repite; lo que espera, en «un 409 request_in_progress»)
+foreach (array(array("GET", "duplicated_request", "Duplicated request", 3, "0"), array("PATCH", "duplicated_request", "Duplicated request", 3, "0"),
+               array("POST", "duplicated_request", "Duplicated request", 3, "0"), array("POST", "request_in_progress", "Request in progress", 1, "3600"),
+               array("PATCH", "request_in_progress", "Request in progress", 1, "0"), array("POST", "already_exists", "Request in progress", 1, "0")) as $c) {
+    list($metodo, $code, $mensaje, $n, $ra) = $c;
+    $r409 = json(409, array("status" => "error", "code" => $code, "message" => $mensaje), array("Retry-After" => $ra));
     plan(array($r409, $r409, $r409));
     $e = error(function () use ($metodo) { cliente(array("retries" => 2))->request($metodo, "/x", array("a" => 1)); });
     ok($e && $e->http === 409 && $e->code === $code && count(peticiones()) === $n, "409 $code en $metodo: $n petición(es)");
 }
+
+echo "== un 409 request_in_progress: se espera con la misma clave (2.1.0)\n";
+// por tiempo (hasta 180 s), no por intentos: un corte (gasta el único reintento de retries 1) y tres 409 (Retry-After: 0, que se
+// espera como 1 s); a la quinta, la respuesta
+$en = json(409, '{"status":"error","code":"request_in_progress","message":"Request in progress"}', array("Retry-After" => "0"));
+plan(array(array("corta" => true), $en, $en, $en, json(200, OK)));
+$t0 = microtime(true);
+$r = null;
+$e = error(function () use (&$r) { $r = cliente(array("retries" => 1))->post("/whatsapp/messages", array("to" => "1")); });
+$d = microtime(true) - $t0;
+$ps = peticiones();
+$claves = array_map(function ($x) { return $x["cabeceras"]["idempotency-key"] ?? ""; }, $ps);
+ok(($r["status"] ?? null) === "success" && count($ps) === 5 && count(array_unique($claves)) === 1
+   && count(array_unique(array_map(function ($x) { return $x["cabeceras"]["x-timestamp"]; }, $ps))) === 5 && $d >= 3 && $d < 8,
+   sprintf("un corte y tres 409 con retries 1: 5 peticiones con la misma clave y X-Timestamp nuevo, a la quinta la respuesta (%.1f s)", $d));
+$en0 = json(409, '{"status":"error","code":"request_in_progress","message":"Request in progress"}');
+plan(array($en0, $en0, json(200, OK)));
+$t0 = microtime(true);
+$r = null;
+$e = error(function () use (&$r) { $r = cliente(array("retries" => 1))->post("/sms", array("to" => "1")); });
+$d = microtime(true) - $t0;
+ok(($r["status"] ?? null) === "success" && count(peticiones()) === 3 && $d >= 3 && $d < 6, sprintf("sin Retry-After: 1 y 2 s (%.1f s)", $d));
+plan(array(json(409, '{"status":"error","code":"request_in_progress","message":"Request in progress"}', array("Retry-After" => "3600"))));
+$t0 = microtime(true);
+$e = error(function () { cliente(array("retries" => 1))->post("/sms", array("to" => "1"), array("idempotencyKey" => "pedido-881")); });
+ok($e && $e->http === 409 && $e->code === "request_in_progress" && $e->idempotencyKey === "pedido-881" && count(peticiones()) === 1
+   && microtime(true) - $t0 < 1, "Retry-After pide más de lo que queda de los 180 s: no espera, y el error lleva la clave");
+plan(array($en));
+$e = error(function () { cliente(array("retries" => 0))->post("/sms", array("to" => "1")); });
+$ps = peticiones();
+ok($e && count($ps) === 1 && $e->idempotencyKey !== null && $e->idempotencyKey === ($ps[0]["cabeceras"]["idempotency-key"] ?? ""),
+   "con retries 0, ninguno; y la clave puesta por el SDK, en el error");
 
 echo "== los campos del error\n";
 plan(array(json(404, '{"status":"error","code":"not_found","message":"Call not found","detail":"no call 999"}', array("X-Request-Id" => "req-1")),
@@ -161,13 +194,23 @@ plan(array(json(404, '{"status":"error","code":"not_found","message":"Call not f
 $api = cliente(array("retries" => 0));
 $e = error(function () use ($api) { $api->get("/calls/out/999"); });
 ok($e && $e->http === 404 && $e->code === "not_found" && $e->getCode() === "not_found" && $e->getMessage() === "Call not found"
-   && $e->detail === "no call 999" && $e->requestId === "req-1" && ($e->response["status"] ?? null) === "error" && !property_exists($e, "statusCode"),
-   "un 404: http, code (también getCode()), message, detail, requestId y response");
+   && $e->detail === "no call 999" && $e->requestId === "req-1" && ($e->response["status"] ?? null) === "error" && !property_exists($e, "statusCode")
+   && property_exists($e, "idempotencyKey") && $e->idempotencyKey === null,
+   "un 404: http, code (también getCode()), message, detail, requestId, response y, en un GET, idempotencyKey null");
 $e = error(function () use ($api) { $api->post("/whatsapp/messages", array("to" => "1")); });
 ok($e && $e->http === 200 && $e->code === "whatsapp_rejected" && ($e->data["id"] ?? null) === "wam-1", "un 200 con status error es un error, con su code");
+$ps = peticiones();
+ok($e && is_string($e->idempotencyKey ?? null) && preg_match('/^[0-9a-f-]{36}$/', $e->idempotencyKey) && $e->idempotencyKey === ($ps[1]["cabeceras"]["idempotency-key"] ?? ""),
+   "el error de un POST lleva la Idempotency-Key que usó (2.1.0)");
 $e = error(function () use ($api) { $api->get("/calls"); });
 ok($e && $e->http === 502 && $e->code === null && $e->getMessage() === "HTTP 502" && $e->response === null, "un 502 sin JSON: sin code");
 ok(($api->post("/whatsapp/messages", array("to" => "1"))["data"]["state"] ?? null) === "unknown", "el 202 de un WhatsApp sin confirmar no es un error");
+// 2.1.0: sin respuesta (aquí, la conexión se corta), el error de un POST lleva la clave con la que repetirlo. Antes del caso
+// lento: el servidor de prueba atiende de uno en uno, y el lento lo deja ocupado 1,5 s
+plan(array(array("corta" => true)));
+$e = error(function () { cliente(array("retries" => 0))->post("/sms", array("to" => "1"), array("idempotencyKey" => "pedido-882")); });
+ok($e && $e->http === 0 && ($e->idempotencyKey ?? null) === "pedido-882" && strncmp($e->getMessage(), "No response from", 16) === 0,
+   "sin respuesta, el error de un POST lleva la clave con la que repetirlo (2.1.0)");
 plan(array(json(200, OK) + array("lento" => true)));
 $t0 = microtime(true);
 $e = error(function () { cliente(array("timeout" => 0.3, "retries" => 0))->get("/calls"); });

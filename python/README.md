@@ -40,12 +40,14 @@ except MundoSMSError as e:
   `next_cursor` queda en `last_cursor`.
 - Las rutas que devuelven un fichero (una grabación, una locución, el PDF de un certificado) vuelven como
   `{"status": "success", "content_type": …, "body": …}`, con el contenido en `bytes`.
-- Cualquier error es una excepción `MundoSMSError` con `http`, `code`, `message`, `detail`, `data`, `request_id` y
-  `response` (la respuesta entera), siempre que la API contesta con `"status": "error"`. Un WhatsApp sin confirmar (`202`,
-  `data["state"]` `"unknown"`: puede haber salido) no es un error: vuelve la respuesta, y no se reenvía.
+- Cualquier error es una excepción `MundoSMSError` con `http`, `code`, `message`, `detail`, `data`, `request_id`,
+  `idempotency_key` (la `Idempotency-Key` que llevó la petición, para repetirla con la misma) y `response` (la respuesta
+  entera), siempre que la API contesta con `"status": "error"`. Un WhatsApp sin confirmar (`202`, `data["state"]`
+  `"unknown"`: puede haber salido) no es un error: vuelve la respuesta, y no se reenvía.
 - Cada `POST` lleva una `Idempotency-Key`, la misma en todos sus intentos: por eso se reintenta sin miedo si se queda sin
   respuesta. La tuya (el id de tu pedido, por ejemplo): `api.post(path, data, idempotency_key="pedido-881")`. Si la API
-  devuelve la respuesta guardada de la primera vez, trae `"idempotent_replayed": True`.
+  devuelve la respuesta guardada de la primera vez, trae `"idempotent_replayed": True`. Un `409` `request_in_progress` (la
+  primera con esa clave aún se está haciendo) se repite con la misma clave hasta 180 segundos.
 - `MundoSMS.verify_webhook(secret, header, body)` comprueba la cabecera `X-MundoSMS-Signature` de un aviso que te llega
   (de `callback_url` o un webhook de WhatsApp), con el cuerpo tal cual llegó (`bytes`): `True` o `False`.
 - Opciones, con nombre: `MundoSMS(token, private_key, base_url=…, retries=3, timeout=60)`. Un valor que no vale es un

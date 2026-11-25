@@ -206,15 +206,85 @@ class MundoSMSTest < Minitest::Test
      ["POST", 429, "requests_per_second", "Too many requests", 3], ["PATCH", 429, "requests_per_second", "Too many requests", 3],
      ["GET", 409, "duplicated_request", "Duplicated request", 3],
      ["PATCH", 409, "duplicated_request", "Duplicated request (the same signed request arrived twice)", 3],
-     ["POST", 409, "duplicated_request", "Duplicated request", 3], ["POST", 409, "request_in_progress", "Request in progress", 3],
+     ["POST", 409, "duplicated_request", "Duplicated request", 3], ["POST", 409, "request_in_progress", "Request in progress", 1],
      ["PATCH", 409, "request_in_progress", "Request in progress", 1], ["POST", 409, "already_exists", "Request in progress", 1],
      ["GET", 404, "not_found", "Call not found", 1],
      ["POST", 422, "idempotency_key_reused", "Idempotency-Key already used", 1]].each do |method, status, code, message, want|
-      s = server { json(status, %({"status":"error","code":"#{code}","message":"#{message}"}), "Retry-After" => "0") }
-      e = assert_raises(MundoSMS::Error) { client(s, retries: 2).request(method, "/x", { "a" => 1 }) }
+      # el POST con request_in_progress, con Retry-After de una hora: más de lo que se espera (lo que espera, en
+      # test_in_progress_waits_by_time)
+      ra = method == "POST" && code == "request_in_progress" ? "3600" : "0"
+      s = server { json(status, %({"status":"error","code":"#{code}","message":"#{message}"}), "Retry-After" => ra) }
+      # si algún 409 se esperase sin deber, que se note en segundos
+      e = with_in_progress_wait(3) { assert_raises(MundoSMS::Error) { client(s, retries: 2).request(method, "/x", { "a" => 1 }) } }
       assert_equal [status, code, message], [e.http, e.code, e.message]
       assert_equal want, s.requests.size, "#{method} #{status} #{code}"
     end
+  end
+
+  # 2.1.0: un 409 request_in_progress se repite con la MISMA clave por tiempo (hasta 180 s desde el primero), no por intentos.
+  def test_in_progress_waits_by_time
+    en = '{"status":"error","code":"request_in_progress","message":"Request in progress"}'
+    # (a) un corte (gasta el único reintento de retries: 1) y tres 409 con Retry-After: 0 (se espera como 1 s); a la quinta, la
+    # respuesta
+    s = server do |n, _|
+      if n == 1 then :close
+      elsif n < 5 then json(409, en, "Retry-After" => "0")
+      else json(200, OK_BODY)
+      end
+    end
+    t0 = Time.now
+    assert_equal "success", client(s, retries: 1).post("/whatsapp/messages", { "to" => "1" })["status"]
+    el = Time.now - t0
+    r = s.requests
+    assert_equal [5, 1, 5], [r.size, r.map { |x| x.headers["idempotency-key"] }.uniq.size, r.map { |x| x.headers["x-timestamp"] }.uniq.size]
+    assert el.between?(3, 8), "(a) #{el}"
+    # (b) sin Retry-After: 1 y 2 s
+    s = server { |n, _| n < 3 ? json(409, en) : json(200, OK_BODY) }
+    t0 = Time.now
+    assert_equal "success", client(s, retries: 1).post("/sms", { "to" => "1" })["status"]
+    assert_equal 3, s.requests.size
+    assert (Time.now - t0).between?(3, 6), "(b) #{Time.now - t0}"
+    # (c) Retry-After pide más de lo que queda de los 180 s: no espera; el error lleva la clave para repetirlo más tarde
+    s = server { json(409, en, "Retry-After" => "3600") }
+    t0 = Time.now
+    e = assert_raises(MundoSMS::Error) do # si esperase, que se note en segundos y no en minutos
+      Timeout.timeout(3) { client(s, retries: 1).post("/sms", { "to" => "1" }, idempotency_key: "pedido-881") }
+    end
+    assert_equal [409, "request_in_progress", "pedido-881", 1], [e.http, e.code, e.idempotency_key, s.requests.size]
+    assert_operator Time.now - t0, :<, 1
+    # (d) con retries: 0, ninguno; y la clave puesta por el SDK, en el error
+    s = server { json(409, en, "Retry-After" => "0") }
+    e = with_in_progress_wait(3) { assert_raises(MundoSMS::Error) { client(s, retries: 0).post("/sms", { "to" => "1" }) } }
+    assert_equal [s.requests[0].headers["idempotency-key"], 1], [e.idempotency_key, s.requests.size]
+    refute_nil e.idempotency_key
+    # (e) el tope (aquí, 2,5 s en vez de 180): tras dos esperas de 1 s, la tercera no cabe
+    s = server { json(409, en, "Retry-After" => "0") }
+    e = with_in_progress_wait(2.5) { assert_raises(MundoSMS::Error) { Timeout.timeout(6) { client(s).post("/sms", { "to" => "1" }) } } }
+    assert_equal ["request_in_progress", 3], [e.code, s.requests.size]
+  end
+
+  # El tope de la espera de request_in_progress (IN_PROGRESS_WAIT), cambiado mientras dura el bloque.
+  def with_in_progress_wait(segundos)
+    tope = MundoSMS::IN_PROGRESS_WAIT
+    MundoSMS.send(:remove_const, :IN_PROGRESS_WAIT)
+    MundoSMS.const_set(:IN_PROGRESS_WAIT, segundos)
+    yield
+  ensure
+    MundoSMS.send(:remove_const, :IN_PROGRESS_WAIT)
+    MundoSMS.const_set(:IN_PROGRESS_WAIT, tope)
+  end
+
+  def test_in_progress_wait
+    api = MundoSMS::Client.new(TOKEN, KEY)
+    future = (Time.now + 3).httpdate
+    [[nil, 1, 180, 1], ["", 4, 180, 8], ["", 9, 180, 15], ["", 9, 10, nil], ["0", 1, 180, 1], ["-5", 1, 180, 1], ["30", 1, 180, 30],
+     ["120", 1, 180, 60], ["120", 1, 100, nil], ["3600", 1, 180, nil], ["NaN", 2, 180, 2], ["0", 1, 0.5, nil]].each do |h, n, quedan, want|
+      w = api.send(:in_progress_wait, h, n, quedan)
+      msg = "Retry-After #{h.inspect}, n #{n}, quedan #{quedan}"
+      want.nil? ? assert_nil(w, msg) : assert_equal(want, w, msg)
+    end
+    w = api.send(:in_progress_wait, future, 1, 180)
+    assert w.between?(1, 3), "Retry-After con fecha: #{w}"
   end
 
   def test_retry_wait
@@ -242,6 +312,7 @@ class MundoSMSTest < Minitest::Test
     keys = s.requests.map { |x| x.headers["idempotency-key"] }
     assert_equal 3, keys.size
     assert_equal 1, keys.uniq.size, "el POST sin respuesta se repite con la misma Idempotency-Key"
+    assert_equal keys[0], e.idempotency_key, "2.1.0: sin respuesta, el error lleva la clave con la que repetirlo"
   end
 
   def test_timeout_whole_request
@@ -278,9 +349,12 @@ class MundoSMSTest < Minitest::Test
     api = client(s, retries: 0)
     e = assert_raises(MundoSMS::Error) { api.get("/calls/out/999") }
     assert_equal [404, "not_found", "Call not found", "no call 999 of type out", "req-1", "error"], [e.http, e.code, e.message, e.detail, e.request_id, e.response["status"]]
+    assert_nil e.idempotency_key, "un GET no lleva clave"
     refute_respond_to e, :status_code
     e = assert_raises(MundoSMS::Error) { api.post("/whatsapp/messages", { "to" => "1" }) }
     assert_equal [200, "whatsapp_rejected", "wam-1"], [e.http, e.code, e.data["id"]]
+    refute_nil e.idempotency_key
+    assert_equal s.requests[1].headers["idempotency-key"], e.idempotency_key, "2.1.0: el error de un POST lleva la Idempotency-Key que usó"
     e = assert_raises(MundoSMS::Error) { api.get("/calls") }
     assert_equal [502, nil, "HTTP 502", nil, "req-3"], [e.http, e.code, e.message, e.response, e.request_id]
     assert_equal "unknown", api.post("/whatsapp/messages", { "to" => "1" })["data"]["state"]

@@ -71,14 +71,21 @@ import javax.crypto.spec.SecretKeySpec;
  * (o {@code BigInteger} si no caben), los decimales como {@code Double}, y {@code Boolean} y {@code null}.
  *
  * <p>Errores: excepción {@link MundoSMSError} (no comprobada) con {@code getHttp()} (código HTTP), {@code getCode()} (la
- * palabra de la API: "not_found", "invalid_parameter"…), {@code getMessage()}, {@code getDetail()}, {@code getData()}, {@code getResponse()} (la respuesta entera) y
- * {@code getRequestId()} (la cabecera X-Request-Id). También cuando la API contesta con "status": "error", venga con el código HTTP que venga. Un WhatsApp sin
+ * palabra de la API: "not_found", "invalid_parameter"…), {@code getMessage()}, {@code getDetail()}, {@code getData()}, {@code getResponse()} (la respuesta entera),
+ * {@code getRequestId()} (la cabecera X-Request-Id) y {@code getIdempotencyKey()} (la Idempotency-Key que llevó la petición: la de un POST, para
+ * repetirlo tú con la misma). También cuando la API contesta con "status": "error", venga con el código HTTP que venga. Un WhatsApp sin
  * confirmar (202) no es un error: vuelve la respuesta, con data.state "unknown".
  *
  * <p>Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
  * {@code api.post(path, data, new MundoSMS.RequestOptions().idempotencyKey("pedido-881"))}). Por eso un POST que falla por
  * la red, o con 409 request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada
  * de la primera vez, trae {@code "idempotent_replayed"} = {@code Boolean.TRUE}.
+ *
+ * <p>Un 409 request_in_progress (la primera petición con esa clave aún se está haciendo: un WhatsApp con un fichero puede
+ * tardar 2 o 3 minutos) se repite con la misma clave hasta 180 s desde el primero, sin contar en {@code retries}: espera lo
+ * que diga Retry-After (al menos 1 s) o 1, 2, 4, 8 y luego 15 s. Si Retry-After pide más de lo que queda, o se acaban los
+ * 180 s, es un {@link MundoSMSError} con su {@code getIdempotencyKey()}: repítelo más tarde con ella. Con {@code retries(0)},
+ * no se repite.
  *
  * <p>Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un
  * POST con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
@@ -99,13 +106,15 @@ import javax.crypto.spec.SecretKeySpec;
 public class MundoSMS {
 
     /** La versión de este cliente: va también en el User-Agent. */
-    public static final String VERSION = "2.0.0";
+    public static final String VERSION = "2.1.0";
 
     /** Los segundos que puede alejarse de tu hora la «t» de la firma de un aviso, si no dices otra cosa. */
     public static final long WEBHOOK_TOLERANCE = 300;
 
     private static final String DEFAULT_BASE_URL = "https://api.mundosms.es/v3";
     private static final int MAX_RETRY_DELAY = 60;   // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
+    private static final int IN_PROGRESS_WAIT = 180;   // segundos: lo más que se espera, con la misma Idempotency-Key, a un POST que sigue en marcha (409 request_in_progress)
+    private static final int IN_PROGRESS_STEP = 15;    // segundos: lo más que se espera entre dos intentos de ese POST si la API no manda Retry-After
     private static final int MAX_DEPTH = 1000;   // anidamiento de un JSON (contra respuestas o datos que se contienen a sí mismos)
     private static final Set<String> QUERY_METHODS = new HashSet<String>(Arrays.asList("GET", "DELETE", "HEAD", "OPTIONS", "TRACE"));
     private static final Set<String> NATIVE_METHODS = new HashSet<String>(Arrays.asList("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "TRACE"));
@@ -524,6 +533,8 @@ public class MundoSMS {
         boolean noStreaming = false;
         boolean afterNetwork = false;   // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
         int attempt = 0;
+        int inProgress = 0;             // cuántos 409 request_in_progress lleva esta llamada
+        long inProgressSince = 0;       // cuándo llegó el primero (System.nanoTime)
         while (true) {
             attempt++;
             String ts = String.valueOf(timestamp());   // milisegundos: dos peticiones iguales seguidas no firman igual
@@ -544,7 +555,7 @@ public class MundoSMS {
             } catch (NetworkFailure e) {
                 if (e.interrupted) {
                     lastRateLimit = null;
-                    throw withCause(new MundoSMSError("No response from the API: " + e.getMessage()), e.getCause());
+                    throw withCause(new MundoSMSError("No response from the API: " + e.getMessage(), 0, null, null, null, null, null, idemKey), e.getCause());
                 }
                 networkError = e.getMessage();
                 networkCause = e.getCause();
@@ -557,21 +568,29 @@ public class MundoSMS {
             }
             boolean redirect = r != null && http >= 300 && http < 400;   // de una redirección no se lee nada
             Map<String, Object> j = r == null || redirect ? null : parseJsonObject(r.body);
-            if (retryable(verb, networkError != null, http, j, idemKey) && attempt <= retries
-                && pause(retryDelay(r == null ? null : r.retryAfter, attempt))) {
+            if (retries > 0 && inProgress(verb, http, j, idemKey)) {
+                long now = System.nanoTime();
+                if (inProgress++ == 0) inProgressSince = now;
+                Double wait = inProgressDelay(r.retryAfter, inProgress, IN_PROGRESS_WAIT - (now - inProgressSince) / 1e9);
+                if (wait != null && pause(wait)) {   // la primera con esta clave sigue en marcha: se espera y se repite, sin gastar retries
+                    attempt--;
+                    continue;
+                }
+            } else if (retryable(verb, networkError != null, http, j, idemKey) && attempt <= retries
+                       && pause(retryDelay(r == null ? null : r.retryAfter, attempt))) {
                 afterNetwork = afterNetwork || networkError != null || duplicated(http, j);
                 continue;
             }
             if (networkError != null) {
                 lastRateLimit = null;
-                throw withCause(new MundoSMSError("No response from the API: " + networkError), networkCause);
+                throw withCause(new MundoSMSError("No response from the API: " + networkError, 0, null, null, null, null, null, idemKey), networkCause);
             }
             lastRateLimit = r.rateLimit;
             if (redirect) {   // no se sigue: llevaría el token y la firma a otro servidor
                 String where = r.location == null || r.location.trim().isEmpty() ? ""
                              : " to " + (r.location.trim().length() > 300 ? r.location.trim().substring(0, 300) : r.location.trim());
                 throw new MundoSMSError("HTTP " + http + ": redirect" + where + " not followed (the API does not redirect: check baseUrl)",
-                                        http, null, null, null, null, r.requestId);
+                                        http, null, null, null, null, r.requestId, idemKey);
             }
             if (r.replayed && j != null) j.put("idempotent_replayed", Boolean.TRUE);   // la respuesta guardada de la primera vez
             if (http >= 200 && http < 300) {
@@ -579,7 +598,7 @@ public class MundoSMS {
                     String type = r.contentType == null ? "" : r.contentType.split(";", 2)[0].trim();
                     if (r.body.length > 0 && !isFileType(type)) {
                         throw new MundoSMSError("HTTP " + http + ": the response is not JSON (" + (type.isEmpty() ? "no Content-Type" : type) + ")",
-                                                http, null, null, null, null, r.requestId);
+                                                http, null, null, null, null, r.requestId, idemKey);
                     }
                     Map<String, Object> f = new LinkedHashMap<String, Object>();
                     f.put("status", "success");
@@ -604,17 +623,18 @@ public class MundoSMS {
             if (j != null) {
                 String message = asText(j.get("message"));
                 if (message == null || message.isEmpty()) message = "Error";
-                throw new MundoSMSError(message, http, code(j), asText(j.get("detail")), j, j.get("data"), r.requestId);
+                throw new MundoSMSError(message, http, code(j), asText(j.get("detail")), j, j.get("data"), r.requestId, idemKey);
             }
-            throw new MundoSMSError("HTTP " + http, http, null, null, null, null, r.requestId);
+            throw new MundoSMSError("HTTP " + http, http, null, null, null, null, r.requestId, idemKey);
         }
     }
 
     /**
-     * Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un
-     * fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST
-     * no: un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo
-     * nada, pero repetirlo con la misma clave se deja a tu código.
+     * Si se puede repetir (hasta {@code retries} veces): un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un
+     * PATCH, un DELETE o un POST con su Idempotency-Key, ante un fallo de red. Un 5xx de un POST no: un 500 puede haberse
+     * hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero repetirlo con la
+     * misma clave se deja a tu código. El 409 request_in_progress va aparte ({@link #inProgress}): se espera por tiempo, no por
+     * intentos.
      */
     private static boolean retryable(String verb, boolean network, int http, Map<String, Object> j, String idemKey) {
         if (http == 429) return true;
@@ -624,8 +644,29 @@ public class MundoSMS {
         network = network || duplicated(http, j);
         if (verb.equals("GET")) return network || http >= 500;
         if (verb.equals("PATCH") || verb.equals("DELETE")) return network;
-        if (idemKey != null) return network || (http == 409 && "request_in_progress".equals(code(j)));
+        if (idemKey != null) return network;
         return false;
+    }
+
+    /** 409 request_in_progress en un POST con su Idempotency-Key: la primera petición con esa clave aún no ha terminado. */
+    private static boolean inProgress(String verb, int http, Map<String, Object> j, String idemKey) {
+        return verb.equals("POST") && idemKey != null && http == 409 && "request_in_progress".equals(code(j));
+    }
+
+    /**
+     * Segundos antes de repetir, con la misma clave, un POST que sigue en marcha (tras su n-ésimo 409 request_in_progress), o
+     * {@code null} si ya no se espera: lo que pida Retry-After (al menos 1 s y como mucho 60) o, sin él, 1, 2, 4, 8 y luego 15.
+     * {@code remaining}: lo que queda de los 180 s. Si Retry-After pide más, o la espera no cabe, {@code null}.
+     */
+    static Double inProgressDelay(String retryAfter, int n, double remaining) {
+        Double s = retryAfterSeconds(retryAfter);
+        if (s == null) {
+            s = Math.min(Math.pow(2, n - 1), IN_PROGRESS_STEP);
+        } else if (s > remaining) {
+            return null;
+        }
+        s = Math.max(1, Math.min(MAX_RETRY_DELAY, s));
+        return s <= remaining ? s : null;
     }
 
     /** 409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
@@ -786,6 +827,8 @@ public class MundoSMS {
         private final transient Object data;
         /** La cabecera X-Request-Id. */
         private final String requestId;
+        /** La Idempotency-Key que llevó la petición. */
+        private final String idempotencyKey;
 
         /**
          * Un error sin respuesta de la API.
@@ -793,7 +836,7 @@ public class MundoSMS {
          * @param message qué pasó
          */
         public MundoSMSError(String message) {
-            this(message, 0, null, null, null, null, null);
+            this(message, 0, null, null, null, null, null, null);
         }
 
         /**
@@ -808,6 +851,23 @@ public class MundoSMS {
          * @param requestId  la cabecera X-Request-Id
          */
         public MundoSMSError(String message, int http, String code, String detail, Map<String, Object> response, Object data, String requestId) {
+            this(message, http, code, detail, response, data, requestId, null);
+        }
+
+        /**
+         * Un error con todo lo que trajo la respuesta y la Idempotency-Key de la petición.
+         *
+         * @param message         el message de la API, o «HTTP 502» si no contestó en JSON
+         * @param http            el código HTTP, 0 si no hubo respuesta
+         * @param code            el code de la API ("not_found"…), o {@code null}
+         * @param detail          el detail de la API
+         * @param response        la respuesta entera, decodificada
+         * @param data            el data de la respuesta
+         * @param requestId       la cabecera X-Request-Id
+         * @param idempotencyKey  la Idempotency-Key que llevó la petición, o {@code null}
+         */
+        public MundoSMSError(String message, int http, String code, String detail, Map<String, Object> response, Object data, String requestId,
+                             String idempotencyKey) {
             super(message);
             this.http = http;
             this.code = code;
@@ -815,6 +875,7 @@ public class MundoSMS {
             this.response = response;
             this.data = data;
             this.requestId = requestId;
+            this.idempotencyKey = idempotencyKey;
         }
 
         /**
@@ -871,6 +932,16 @@ public class MundoSMS {
          */
         public String getRequestId() {
             return requestId;
+        }
+
+        /**
+         * La Idempotency-Key que llevó la petición (la de un POST: la tuya, o la que puso el SDK). Con ella repites el POST sin
+         * que se haga dos veces: tras un 409 request_in_progress que no terminó a tiempo, o sin respuesta.
+         *
+         * @return la Idempotency-Key, o {@code null} si la petición no llevó (un GET, un PATCH o un DELETE sin clave)
+         */
+        public String getIdempotencyKey() {
+            return idempotencyKey;
         }
 
         /**
@@ -1125,6 +1196,13 @@ public class MundoSMS {
 
     /** Segundos antes del siguiente intento: lo que pida Retry-After (segundos o fecha HTTP), o 1, 2, 4… Como mucho 60. */
     static double retryDelay(String retryAfter, int attempt) {
+        Double s = retryAfterSeconds(retryAfter);
+        if (s == null) s = Math.pow(2, attempt - 1);
+        return Math.max(0, Math.min(MAX_RETRY_DELAY, s));
+    }
+
+    /** Los segundos que pide Retry-After (segundos o fecha HTTP), o {@code null} si no viene o no se entiende. */
+    static Double retryAfterSeconds(String retryAfter) {
         Double s = null;
         if (retryAfter != null && !retryAfter.trim().isEmpty()) {
             String t = retryAfter.trim();
@@ -1142,8 +1220,7 @@ public class MundoSMS {
             }
             if (s != null && s.isNaN()) s = null;
         }
-        if (s == null) s = Math.pow(2, attempt - 1);
-        return Math.max(0, Math.min(MAX_RETRY_DELAY, s));
+        return s;
     }
 
     /** Espera; si interrumpen el hilo, no espera más (y deja la marca de interrumpido). */

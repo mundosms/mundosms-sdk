@@ -39,10 +39,13 @@ end
 - `all(path, query)` recorre todas las páginas de un listado (un `Enumerator::Lazy`: pide cada página al llegar a ella).
   Al acabar, el último `next_cursor` queda en `last_cursor`; `last_rate_limit` es el cupo (`X-RateLimit-*`) de la última
   respuesta.
-- Cualquier error es un `MundoSMS::Error` con `http`, `code`, `message`, `detail`, `data`, `request_id` y `response`.
+- Cualquier error es un `MundoSMS::Error` con `http`, `code`, `message`, `detail`, `data`, `request_id`, `response` e
+  `idempotency_key` (la `Idempotency-Key` que llevó la petición: la de un `POST`, para repetirlo con la misma).
   Un WhatsApp sin confirmar (`202`, `data["state"]` `"unknown"`: puede haber salido) no es un error: vuelve la respuesta.
 - Cada `POST` lleva una `Idempotency-Key`, la misma en todos sus intentos; la tuya, con
-  `api.post(path, data, idempotency_key: "pedido-881")`.
+  `api.post(path, data, idempotency_key: "pedido-881")`. Si la API contesta `409` `request_in_progress` (la primera con esa
+  clave aún se está haciendo), lo repite con la misma clave hasta 180 s; si no termina, el error lleva la clave en
+  `idempotency_key` para que lo repitas tú más tarde.
 - Una redirección no se sigue nunca (llevaría tu firma a otro servidor): es un `MundoSMS::Error`.
 - `MundoSMS.verify_webhook(secret, header, body)` comprueba la cabecera `X-MundoSMS-Signature` de un aviso que te llega, con
   el cuerpo tal cual llegó (en Rails, `request.raw_post`, nunca `params`): `true` o `false`.

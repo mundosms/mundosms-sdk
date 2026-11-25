@@ -20,8 +20,9 @@ export interface MundoSMSOptions {
   /** La dirección de la API. Por defecto, `https://api.mundosms.es/v3`. */
   baseUrl?: string;
   /**
-   * Cuántas veces se reintenta lo que es seguro repetir (0, ninguna): un 429 y un fallo de red en cualquier método, un 5xx en
-   * GET y, en POST, un 409 request_in_progress. Por defecto, 3.
+   * Cuántas veces se reintenta lo que es seguro repetir (0, ninguna): un 429 y un fallo de red en cualquier método y un 5xx en
+   * GET. Por defecto, 3. Un 409 request_in_progress en un POST no cuenta aquí: se repite con la misma clave hasta 180 s (con 0,
+   * tampoco se repite).
    */
   retries?: number;
   /** Los segundos que puede durar cada petición entera (conectar, mandar y recibir la respuesta). Admite decimales. Por defecto, 60. */
@@ -123,6 +124,7 @@ export declare class MundoSMSError extends Error {
     response?: ErrorResponse | null,
     data?: any,
     requestId?: string | null,
+    idempotencyKey?: string | null,
   );
   name: "MundoSMSError";
   /** El código HTTP; 0 si no hubo respuesta. */
@@ -140,6 +142,11 @@ export declare class MundoSMSError extends Error {
   data: any;
   /** La cabecera X-Request-Id: con ella encuentras la petición en Logs API. */
   requestId: string | null;
+  /**
+   * La Idempotency-Key que llevó la petición: la de un POST (la tuya o la que puso el SDK), para repetirlo tú con la misma
+   * (por ejemplo, tras un 409 `request_in_progress` que siguió en marcha más de 180 s). `null` si no llevó (GET, PATCH, DELETE).
+   */
+  idempotencyKey: string | null;
   /** Sin respuesta: el error de red de debajo (el de `fetch`). */
   cause?: unknown;
 }
@@ -168,7 +175,8 @@ export declare class MundoSMS {
   get<T = any>(path: string, query?: QueryParams | null): Promise<Result<T>>;
   /**
    * POST: `data` va en un cuerpo JSON. Lleva una `Idempotency-Key` (la de `options` o un UUID nuevo), la misma en todos sus
-   * intentos: por eso se repite sin miedo ante un fallo de red o un 409 request_in_progress.
+   * intentos: por eso se repite sin miedo ante un fallo de red o un 409 request_in_progress (este, hasta 180 s). Si falla, el
+   * error la trae en `idempotencyKey`.
    */
   post<T = any>(path: string, data?: RequestBody | null, options?: RequestOptions | null): Promise<Result<T>>;
   /** PATCH: `data` va en un cuerpo JSON. */

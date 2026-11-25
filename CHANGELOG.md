@@ -1,5 +1,23 @@
 # Cambios
 
+## v2.1.0
+
+Solo se añaden cosas: tu código de la 2.0 sigue funcionando igual.
+
+- **El error lleva la `Idempotency-Key` que usó la petición:** `$e->idempotencyKey` en PHP, `e.idempotency_key` en Python
+  y Ruby, `e.idempotencyKey` en Node.js, `e.getIdempotencyKey()` en Java y `e.IdempotencyKey` en C# y Go. Es la tuya o la
+  que puso el SDK en un `POST`; en un `GET`, un `PATCH` o un `DELETE` sin clave, `null` (`None` en Python, `nil` en Ruby y
+  `""` en Go). Si un `POST` falla sin saber si se hizo, repítelo con esa clave: la API no lo hace dos veces.
+- **Un `POST` que sigue en marcha se espera más.** Un `409` con `code` `request_in_progress` (la primera petición con esa
+  clave aún se está haciendo; un WhatsApp con un fichero puede tardar 2 o 3 minutos) se repite con la misma clave hasta
+  **180 segundos** desde el primero, sin contar en `retries`, y te llega la respuesta de la primera en cuanto termina.
+  Espera lo que diga `Retry-After` (al menos 1 segundo) o, si no lo trae, 1, 2, 4, 8 y luego 15 segundos. Si `Retry-After`
+  pide más de lo que queda, o se acaban los 180 segundos, es un error, con la clave. Con `retries` a `0`, no se repite.
+  Hasta la 2.0.0 se rendía a los tres intentos (unos 7 segundos), sin decirte la clave.
+- `GET /whatsapp/messages` con `all()`: la API ya no aplica `from_datetime` desde la segunda página en orden `asc` (solo
+  elige dónde empieza), así que un mensaje que llega tarde con una hora anterior (un historial importado) ya no se queda
+  fuera. No cambia nada en el SDK: `all()` sigue mandando los mismos filtros en cada página.
+
 ## v2.0.0
 
 **Cambia el error: si tu código lee `status_code`, cámbialo al actualizar.** La API REST deja de mandar `status_code`, en

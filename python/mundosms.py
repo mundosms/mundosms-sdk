@@ -10,13 +10,18 @@ Código y versiones: https://github.com/mundosms/mundosms-sdk (licencia MIT)
         ...
 
 Errores: excepción MundoSMSError con .http (código HTTP), .code (la palabra de la API: "not_found", "invalid_parameter"…),
-.message (también str(e)), .detail, .data, .response (la respuesta entera) y .request_id (la cabecera X-Request-Id). También
+.message (también str(e)), .detail, .data, .response (la respuesta entera), .request_id (la cabecera X-Request-Id) e
+.idempotency_key (la Idempotency-Key que llevó la petición: la de un POST, para repetirlo tú con la misma). También
 cuando la API contesta con "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta,
 con data["state"] "unknown".
 Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
 post(path, data, idempotency_key="pedido-881")). Por eso un POST que falla por la red, o con 409 request_in_progress, se
 repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
 "idempotent_replayed": True.
+Un 409 request_in_progress (la primera petición con esa clave aún se está haciendo: un WhatsApp con un fichero puede tardar
+2 o 3 minutos) se repite con la misma clave hasta IN_PROGRESS_WAIT (180 s) desde el primero, sin contar en retries: espera lo
+que diga Retry-After (al menos 1 s) o 1, 2, 4, 8 y luego 15 s. Si Retry-After pide más de lo que queda, o se acaban los 180 s,
+es un MundoSMSError con su .idempotency_key: repítelo más tarde con ella. Con retries=0, no se repite.
 Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
 con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
 repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
@@ -42,8 +47,10 @@ import urllib.parse
 import urllib.request
 from email.utils import parsedate_to_datetime
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 MAX_RETRY_WAIT = 60      # segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
+IN_PROGRESS_WAIT = 180   # segundos: lo más que se espera, con la misma Idempotency-Key, a un POST que sigue en marcha (409 request_in_progress)
+IN_PROGRESS_STEP = 15    # segundos: lo más que se espera entre dos intentos de ese POST si la API no manda Retry-After
 WEBHOOK_TOLERANCE = 300  # segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
 _IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,64}")   # la forma que exige la API para la Idempotency-Key
 _last_timestamp = 0                # el X-Timestamp de la última petición de este proceso (milisegundos)
@@ -54,7 +61,7 @@ class MundoSMSError(Exception):
     """El error de cualquier petición: un 4xx o un 5xx, una respuesta 2xx con "status": "error" o, sin respuesta (la red o
     el plazo agotado), http 0 y un mensaje que empieza por «No response from the API:»."""
 
-    def __init__(self, message, http=0, code=None, detail=None, response=None, data=None, request_id=None):
+    def __init__(self, message, http=0, code=None, detail=None, response=None, data=None, request_id=None, idempotency_key=None):
         super().__init__(message)
         self.message = message           # el message de la API ("Call not found"…) o el del SDK
         self.http = http                 # el código HTTP; 0 si no hubo respuesta
@@ -63,9 +70,11 @@ class MundoSMSError(Exception):
         self.response = response         # la respuesta entera, decodificada; None si no era JSON
         self.data = data                 # el data de la respuesta (en WhatsApp, el id del mensaje que puede haber salido)
         self.request_id = request_id     # la cabecera X-Request-Id: con ella encuentras la petición en Logs API
+        self.idempotency_key = idempotency_key   # la Idempotency-Key que llevó la petición (la de un POST); None si no llevó
 
     def __reduce__(self):   # con pickle (Celery, multiprocessing), con todos sus campos y no solo el mensaje
-        return (self.__class__, (self.message, self.http, self.code, self.detail, self.response, self.data, self.request_id))
+        return (self.__class__, (self.message, self.http, self.code, self.detail, self.response, self.data, self.request_id,
+                                 self.idempotency_key))
 
 
 class MundoSMS:
@@ -165,6 +174,7 @@ class MundoSMS:
         signed_path = base_path + rest   # lo que se firma es justo lo que se manda
         attempt = 0
         after_network = False   # un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
+        in_progress = []        # cuándo llegó cada 409 request_in_progress de esta llamada (reloj monotónico)
         while True:
             attempt += 1
             ts = _timestamp()   # un reintento inmediato, o dos peticiones iguales a la vez, no firman igual
@@ -204,17 +214,25 @@ class MundoSMS:
                     j = None
                 if not isinstance(j, dict):
                     j = None
-            if _retryable(method, bool(network_error), http_, j, idem_key) and attempt <= self.retries:
+            if self.retries > 0 and _in_progress(method, http_, j, idem_key):
+                in_progress.append(time.monotonic())
+                wait = _in_progress_wait(resp_headers.get("Retry-After"), len(in_progress),
+                                         IN_PROGRESS_WAIT - (in_progress[-1] - in_progress[0]))
+                if wait is not None:   # la primera con esta clave sigue en marcha: se espera y se repite, sin gastar retries
+                    attempt -= 1
+                    time.sleep(wait)
+                    continue
+            elif _retryable(method, bool(network_error), http_, j, idem_key) and attempt <= self.retries:
                 after_network = after_network or bool(network_error) or _duplicated(http_, j)
                 time.sleep(_retry_wait(resp_headers.get("Retry-After"), attempt))
                 continue
             if network_error:
                 self.last_rate_limit = None
-                raise MundoSMSError("No response from the API: " + network_error)
+                raise MundoSMSError("No response from the API: " + network_error, idempotency_key=idem_key)
             self.last_rate_limit = _rate_limit(resp_headers)
             rid = resp_headers.get("X-Request-Id")
             if 300 <= http_ < 400:   # no se sigue: llevaría el token y la firma a otro servidor
-                raise MundoSMSError(_redirected(http_, resp_headers.get("Location")), http_, request_id=rid)
+                raise MundoSMSError(_redirected(http_, resp_headers.get("Location")), http_, request_id=rid, idempotency_key=idem_key)
             replayed = str(resp_headers.get("Idempotent-Replayed", "")).strip().lower() == "true"
             if replayed and j is not None:
                 j["idempotent_replayed"] = True   # la respuesta guardada de la primera vez: no se ha vuelto a hacer
@@ -222,7 +240,7 @@ class MundoSMS:
                 if j is None:   # un fichero, o algo que no es de la API
                     content_type = resp_headers.get("Content-Type", "") or ""
                     if resp and not _is_file(content_type):
-                        raise MundoSMSError(_not_json(http_, content_type), http_, request_id=rid)
+                        raise MundoSMSError(_not_json(http_, content_type), http_, request_id=rid, idempotency_key=idem_key)
                     file = {"status": "success", "content_type": content_type, "body": resp}
                     if replayed:
                         file["idempotent_replayed"] = True
@@ -232,8 +250,9 @@ class MundoSMS:
             if method == "DELETE" and after_network and http_ == 404 and j is not None and j.get("code") != "route_not_found":
                 return _already_deleted()   # lo borró el intento que se quedó sin respuesta
             if j is not None:
-                raise MundoSMSError(j.get("message", "Error"), http_, _text(j.get("code")), j.get("detail"), j, j.get("data"), rid)
-            raise MundoSMSError("HTTP %d" % http_, http_, request_id=rid)
+                raise MundoSMSError(j.get("message", "Error"), http_, _text(j.get("code")), j.get("detail"), j, j.get("data"), rid,
+                                    idem_key)
+            raise MundoSMSError("HTTP %d" % http_, http_, request_id=rid, idempotency_key=idem_key)
 
     @staticmethod
     def verify_webhook(secret, header, body, tolerance=WEBHOOK_TOLERANCE):
@@ -355,11 +374,12 @@ def _idempotency_key(key, method):
 
 
 def _retryable(method, network, http_, j, idem_key):
-    """Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un
-    fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST no:
-    un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero
-    repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó dos veces:
-    la repitió algo entre medias, como hace un cliente HTTP con una conexión que se cerró) es un fallo de red más."""
+    """Si se puede repetir (hasta retries veces): un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH,
+    un DELETE o un POST con su Idempotency-Key, ante un fallo de red. Un 5xx de un POST no: un 500 puede haberse hecho y la API
+    lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero repetirlo con la misma clave se
+    deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó dos veces: la repitió algo entre medias, como
+    hace un cliente HTTP con una conexión que se cerró) es un fallo de red más. El 409 request_in_progress va aparte
+    (_in_progress): se espera por tiempo, no por intentos."""
     if http_ == 429:
         return True
     network = network or _duplicated(http_, j)
@@ -368,8 +388,26 @@ def _retryable(method, network, http_, j, idem_key):
     if method in ("PATCH", "DELETE"):
         return network
     if idem_key:
-        return network or (http_ == 409 and _code(j) == "request_in_progress")
+        return network
     return False
+
+
+def _in_progress(method, http_, j, idem_key):
+    """409 request_in_progress en un POST con su Idempotency-Key: la primera petición con esa clave aún no ha terminado."""
+    return method == "POST" and bool(idem_key) and http_ == 409 and _code(j) == "request_in_progress"
+
+
+def _in_progress_wait(retry_after, n, remaining):
+    """Segundos antes de repetir, con la misma clave, un POST que sigue en marcha (tras su n-ésimo 409 request_in_progress), o
+    None si ya no se espera: lo que pida Retry-After (al menos 1 s y como mucho MAX_RETRY_WAIT) o, sin él, 1, 2, 4, 8 y luego
+    IN_PROGRESS_STEP. remaining: lo que queda de IN_PROGRESS_WAIT. Si Retry-After pide más, o la espera no cabe, None."""
+    s = _retry_after_seconds(retry_after)
+    if s is None:
+        s = min(2 ** (n - 1), IN_PROGRESS_STEP)
+    elif s > remaining:
+        return None
+    s = max(1.0, min(MAX_RETRY_WAIT, s))
+    return s if s <= remaining else None
 
 
 def _q(s):
@@ -406,8 +444,8 @@ def _split_path(path, strip_v3):
     return "/".join(segments), path_query
 
 
-def _retry_wait(retry_after, attempt):
-    """Segundos antes del siguiente intento: lo que pida Retry-After (segundos o fecha HTTP), o 1, 2, 4… Como mucho 60."""
+def _retry_after_seconds(retry_after):
+    """Los segundos que pide Retry-After (segundos o fecha HTTP), o None si no viene o no se entiende."""
     s = None
     if retry_after:
         try:
@@ -417,7 +455,13 @@ def _retry_wait(retry_after, attempt):
                 s = parsedate_to_datetime(retry_after).timestamp() - time.time()
             except (TypeError, ValueError, IndexError, OverflowError):
                 s = None
-    if s is None or s != s:   # sin cabecera, o NaN
+    return None if s is None or s != s else s   # NaN, como si no viniera
+
+
+def _retry_wait(retry_after, attempt):
+    """Segundos antes del siguiente intento: lo que pida Retry-After (segundos o fecha HTTP), o 1, 2, 4… Como mucho 60."""
+    s = _retry_after_seconds(retry_after)
+    if s is None:   # sin cabecera, o NaN
         s = 2 ** (attempt - 1)
     return max(0.0, min(MAX_RETRY_WAIT, s))
 

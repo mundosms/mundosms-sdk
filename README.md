@@ -123,11 +123,11 @@ Está en Maven Central, `es.mundosms:mundosms-sdk`, sin dependencias. Funciona d
 <dependency>
   <groupId>es.mundosms</groupId>
   <artifactId>mundosms-sdk</artifactId>
-  <version>2.0.0</version>
+  <version>2.1.0</version>
 </dependency>
 ```
 
-(con Gradle, `implementation("es.mundosms:mundosms-sdk:2.0.0")` en `dependencies`). También puedes copiar el fichero:
+(con Gradle, `implementation("es.mundosms:mundosms-sdk:2.1.0")` en `dependencies`). También puedes copiar el fichero:
 `MundoSMS.java` es del paquete `es.mundosms` y va en la carpeta `es/mundosms/` de tus fuentes (con Maven o Gradle,
 `src/main/java/es/mundosms/MundoSMS.java`).
 
@@ -385,6 +385,7 @@ lo reenvíes.
 | `detail` | `$e->detail` | `e.detail` | `e.detail` | `e.getDetail()` | `e.Detail` | `e.Detail` | `e.detail` |
 | `data` de la respuesta | `$e->data` | `e.data` | `e.data` | `e.getData()` | `e.Data` | `e.Data` | `e.data` |
 | la cabecera `X-Request-Id` | `$e->requestId` | `e.request_id` | `e.requestId` | `e.getRequestId()` | `e.RequestId` | `e.RequestID` | `e.request_id` |
+| la `Idempotency-Key` que llevó la petición (desde la 2.1.0) | `$e->idempotencyKey` | `e.idempotency_key` | `e.idempotencyKey` | `e.getIdempotencyKey()` | `e.IdempotencyKey` | `e.IdempotencyKey` | `e.idempotency_key` |
 | la respuesta entera, decodificada | `$e->response` | `e.response` | `e.response` | `e.getResponse()` | `e.Response` | `e.Response` | `e.response` |
 
 - **Decide por `code`, nunca por el mensaje:** `code` es una palabra en inglés y en snake_case que no cambia
@@ -394,6 +395,10 @@ lo reenvíes.
   `nil` en Ruby y `""` en Go). Una respuesta buena no lleva `code`.
 - Guarda el `X-Request-Id` cuando algo falle: con él encuentras la petición en Logs API y, si nos escribes, la
   encontramos nosotros.
+- La `Idempotency-Key` del error es la que llevó la petición: la tuya o la que puso el SDK en un `POST` (en un `GET`, un
+  `PATCH` o un `DELETE` sin clave, `null`, `None`, `nil` o `""` en Go). Si un `POST` falla sin saber si se hizo (sin
+  respuesta, o un `409` `request_in_progress` que no terminó a tiempo), repítelo **con esa clave**: la API no lo hace dos
+  veces.
 - Sin respuesta (la red, o el plazo agotado), `http` es `0` y el mensaje empieza por `No response from the API:`, seguido
   de la causa (`timed out after 60 s` si se agotó el plazo). Los mensajes del SDK van en inglés, como los de la API.
 - **Una redirección (`3xx`) no se sigue nunca:** la API no redirige, y seguirla llevaría tu token, tu firma, la
@@ -421,7 +426,7 @@ Qué se reintenta, hasta `retries` veces (3 por defecto):
 | `429`: demasiadas peticiones (no se hizo nada) | sí | sí | sí |
 | sin respuesta: la red, o el plazo agotado | sí | sí | sí, con la misma `Idempotency-Key` |
 | `409` con `code` `duplicated_request`: la misma petición firmada llegó dos veces (la repitió algo entre medias) | sí | sí | sí, con la misma clave |
-| `409` con `code` `request_in_progress`: la primera con esa clave aún no ha terminado | — | — | sí, con la misma clave |
+| `409` con `code` `request_in_progress`: la primera con esa clave aún no ha terminado | — | — | sí, con la misma clave, hasta 180 segundos (abajo) |
 | `500`: error de la API, puede haberse hecho | sí | no | no: la API guarda el `500` con la clave, y repetirlo con la misma te devolvería el mismo `500` |
 | `503`: no se hizo nada (trae `data.retry: true`) | sí | no | no, aunque se puede: repítelo tú en unos segundos, con la misma clave |
 | `502`, `504` u otro `5xx` que no es JSON: lo escribe el servidor web de delante | sí | no | no: trátalo como un `500`, puede haberse hecho |
@@ -430,6 +435,14 @@ Antes de cada intento se espera lo que diga la cabecera `Retry-After` (como much
 segundos. Cada intento va firmado con su propio `X-Timestamp`, en milisegundos y siempre mayor que el de la petición
 anterior del mismo proceso: un reintento inmediato, o dos peticiones iguales a la vez, nunca firman igual (la API rechazaría
 la segunda por repetida).
+
+**Un `POST` que sigue en marcha** (`409` con `code` `request_in_progress`: la primera petición con esa clave aún se está
+haciendo, por ejemplo un WhatsApp con un fichero, que puede tardar 2 o 3 minutos) se espera por tiempo, no por intentos:
+desde la 2.1.0, el SDK lo repite con la **misma** clave hasta **180 segundos** desde el primer `409`, sin contar en
+`retries`, y te da la respuesta de la primera en cuanto termine. Espera lo que diga `Retry-After` (al menos 1 segundo) o, si
+no la trae, 1, 2, 4, 8 y luego 15 segundos. Si `Retry-After` pide más de lo que queda, o se acaban los 180 segundos, te da
+el error, con la clave en el error para que lo repitas más tarde con ella. Con `retries` a `0`, no lo repite. Hasta la
+2.0.0 se rendía a los tres intentos, unos 7 segundos.
 
 **Tu propia clave.** La clave automática protege los reintentos de una llamada. Si quieres que tampoco se repita cuando
 vuelves a llamar tú (tu programa se reinicia, tu cola reintenta un trabajo), pasa una clave tuya, estable para esa
@@ -729,9 +742,9 @@ La referencia completa de cada ruta, sus parámetros y sus respuestas está en
 
 ## Versiones
 
-Cada versión lleva su etiqueta (`v2.0.0`…) y sus cambios en [CHANGELOG.md](CHANGELOG.md). Para no llevarte cambios sin
-querer, descarga el fichero de una versión concreta. El módulo de Go lleva además su etiqueta, `go/v2.0.0`…, con la misma
-versión: `go get github.com/mundosms/mundosms-sdk/go/v2@v2.0.0` (hasta la 1.2.0, sin `/v2`:
+Cada versión lleva su etiqueta (`v2.1.0`…) y sus cambios en [CHANGELOG.md](CHANGELOG.md). Para no llevarte cambios sin
+querer, descarga el fichero de una versión concreta. El módulo de Go lleva además su etiqueta, `go/v2.1.0`…, con la misma
+versión: `go get github.com/mundosms/mundosms-sdk/go/v2@v2.1.0` (hasta la 1.2.0, sin `/v2`:
 `go get github.com/mundosms/mundosms-sdk/go@v1.2.0`).
 
 Con Composer (`composer require mundosms/sdk`) solo se instala lo de PHP (`php/`, `composer.json`, este README, la licencia

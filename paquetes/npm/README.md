@@ -46,12 +46,16 @@ main().catch((e) => { console.error(e); process.exitCode = 1; });
   el último `next_cursor` queda en `lastCursor`.
 - Las rutas que devuelven un fichero (una grabación, una locución, el PDF de un certificado) vuelven como
   `{ status: "success", content_type, body }`, con el contenido en un `Buffer`.
-- Cualquier error es una excepción `MundoSMSError` con `http`, `code`, `message`, `detail`, `data`, `requestId` y
-  `response` (la respuesta entera), siempre que la API contesta con `"status": "error"`. Un WhatsApp sin confirmar (`202`,
-  `data.state` `"unknown"`: puede haber salido) no es un error: vuelve la respuesta, y no se reenvía.
+- Cualquier error es una excepción `MundoSMSError` con `http`, `code`, `message`, `detail`, `data`, `requestId`,
+  `idempotencyKey` (la `Idempotency-Key` que llevó la petición, en un `POST`) y `response` (la respuesta entera), siempre
+  que la API contesta con `"status": "error"`. Un WhatsApp sin confirmar (`202`, `data.state` `"unknown"`: puede haber
+  salido) no es un error: vuelve la respuesta, y no se reenvía.
 - Cada `POST` lleva una `Idempotency-Key`, la misma en todos sus intentos: por eso se reintenta sin miedo si se queda sin
   respuesta. La tuya (el id de tu pedido, por ejemplo), en el tercer argumento: `api.post(path, data, { idempotencyKey:
   "pedido-881" })`. Si la API devuelve la respuesta guardada de la primera vez, trae `idempotent_replayed: true`.
+- Un `409` con `code` `request_in_progress` (la primera petición con esa clave aún se está haciendo) se repite con la misma
+  clave durante hasta 180 s, sin contar en `retries`. Si sigue en marcha, el error trae la clave en `idempotencyKey`:
+  repítelo más tarde con ella.
 - `MundoSMS.verifyWebhook(secret, header, body)` comprueba la cabecera `X-MundoSMS-Signature` de un aviso que te llega (de
   `callback_url` o un webhook de WhatsApp), con el cuerpo tal cual llegó (un `Buffer`): `true` o `false`.
 - Opciones, en el tercer argumento del constructor: `{ baseUrl, retries, timeout }` (por defecto

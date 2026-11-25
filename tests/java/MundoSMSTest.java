@@ -189,6 +189,21 @@ public class MundoSMSTest {
         return null;
     }
 
+    interface Pide {
+        Map<String, Object> hace() throws Exception;
+    }
+
+    /** La respuesta de f o, si salta un MundoSMSError, {"status": "error …"}: el caso cuenta como fallo y las pruebas siguen. */
+    static Map<String, Object> enMarcha(Pide f) throws Exception {
+        try {
+            return f.hace();
+        } catch (MundoSMSError e) {
+            Map<String, Object> r = new LinkedHashMap<String, Object>();
+            r.put("status", "error " + e.getHttp() + " " + e.getCode());
+            return r;
+        }
+    }
+
     static List<Object> ids(Iterable<Map<String, Object>> l) {
         List<Object> r = new ArrayList<Object>();
         for (Map<String, Object> x : l) r.add(x.get("id"));
@@ -239,17 +254,55 @@ public class MundoSMSTest {
             ok(e != null && e.getHttp() == 500 && "internal_error".equals(e.getCode()) && s.peticiones.size() == 1, "un POST con 5xx no se repite");
         }
         // un 409 se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con
-        // su clave) se repiten; otro 409, aunque su message diga lo mismo, no
-        String[][] casos409 = {{"GET", "duplicated_request", "Duplicated request", "3"}, {"PATCH", "duplicated_request", "Duplicated request", "3"},
-                               {"POST", "duplicated_request", "Duplicated request", "3"}, {"POST", "request_in_progress", "Request in progress", "3"},
-                               {"PATCH", "request_in_progress", "Request in progress", "1"}, {"POST", "already_exists", "Request in progress", "1"}};
+        // su clave) se repiten; otro 409, aunque su message diga lo mismo, no (el POST con request_in_progress, con Retry-After de
+        // una hora: más de lo que se espera, así que no se repite; lo que espera, en «409 request_in_progress»)
+        String[][] casos409 = {{"GET", "duplicated_request", "Duplicated request", "3", "0"}, {"PATCH", "duplicated_request", "Duplicated request", "3", "0"},
+                               {"POST", "duplicated_request", "Duplicated request", "3", "0"}, {"POST", "request_in_progress", "Request in progress", "1", "3600"},
+                               {"PATCH", "request_in_progress", "Request in progress", "1", "0"}, {"POST", "already_exists", "Request in progress", "1", "0"}};
         for (String[] c : casos409) {
             String b = "{\"status\":\"error\",\"code\":\"" + c[1] + "\",\"message\":\"" + c[2] + "\"}";
-            try (Servidor s = new Servidor((n, p) -> json(409, b).con("Retry-After", "0"))) {
+            try (Servidor s = new Servidor((n, p) -> json(409, b).con("Retry-After", c[4]))) {
                 MundoSMSError e = error(() -> cliente(s, 2, 60).request(c[0], "/x", MundoSMS.map("a", 1)));
                 ok(e != null && e.getHttp() == 409 && c[1].equals(e.getCode()) && s.peticiones.size() == Integer.parseInt(c[3]),
                    "409 " + c[1] + " en " + c[0] + ": " + c[3] + " petición(es)");
             }
+        }
+
+        System.out.println("== 409 request_in_progress: se espera por tiempo, con la misma clave (2.1.0)");
+        // un corte (gasta el único reintento de retries 1) y tres 409 con Retry-After: 0 (se espera 1 s), y a la quinta, la respuesta
+        String enMarcha = "{\"status\":\"error\",\"code\":\"request_in_progress\",\"message\":\"Request in progress\"}";
+        try (Servidor s = new Servidor((n, p) -> n == 1 ? null : n < 5 ? json(409, enMarcha).con("Retry-After", "0") : json(200, OK))) {
+            long t0 = System.currentTimeMillis();
+            Map<String, Object> r = enMarcha(() -> cliente(s, 1, 60).post("/whatsapp/messages", MundoSMS.map("to", "1")));
+            long t = System.currentTimeMillis() - t0;
+            Set<String> claves = new HashSet<String>();
+            Set<String> tss = new HashSet<String>();
+            synchronized (s.peticiones) {
+                for (Peticion p : s.peticiones) {
+                    claves.add(p.cabeceras.get("idempotency-key"));
+                    tss.add(p.cabeceras.get("x-timestamp"));
+                }
+            }
+            ok("success".equals(r.get("status")) && s.peticiones.size() == 5 && claves.size() == 1 && !claves.contains(null) && tss.size() == 5
+               && t >= 3000 && t < 8000, "un corte y tres 409 con retries 1: 5 peticiones con la misma clave y la respuesta (" + t + " ms)");
+        }
+        try (Servidor s = new Servidor((n, p) -> n < 3 ? json(409, enMarcha) : json(200, OK))) {
+            long t0 = System.currentTimeMillis();
+            Map<String, Object> r = enMarcha(() -> cliente(s, 1, 60).post("/sms", MundoSMS.map("to", "1")));
+            long t = System.currentTimeMillis() - t0;
+            ok("success".equals(r.get("status")) && s.peticiones.size() == 3 && t >= 3000 && t < 6000, "sin Retry-After: 1 y 2 s (" + t + " ms)");
+        }
+        try (Servidor s = new Servidor((n, p) -> json(409, enMarcha).con("Retry-After", "3600"))) {
+            long t0 = System.currentTimeMillis();
+            MundoSMSError e = error(() -> cliente(s, 1, 60).post("/sms", MundoSMS.map("to", "1"), new MundoSMS.RequestOptions().idempotencyKey("pedido-881")));
+            long t = System.currentTimeMillis() - t0;
+            ok(e != null && e.getHttp() == 409 && "request_in_progress".equals(e.getCode()) && "pedido-881".equals(e.getIdempotencyKey())
+               && s.peticiones.size() == 1 && t < 1000, "Retry-After pide más de lo que queda: no espera, y el error lleva la clave (" + t + " ms)");
+        }
+        try (Servidor s = new Servidor((n, p) -> json(409, enMarcha).con("Retry-After", "0"))) {
+            MundoSMSError e = error(() -> cliente(s, 0, 60).post("/sms", MundoSMS.map("to", "1")));
+            ok(e != null && s.peticiones.size() == 1 && e.getIdempotencyKey() != null && e.getIdempotencyKey().equals(s.peticiones.get(0).cabeceras.get("idempotency-key")),
+               "con retries 0, ninguno; y la clave puesta por el SDK, en el error");
         }
 
         System.out.println("== los campos del error");
@@ -262,9 +315,12 @@ public class MundoSMSTest {
             MundoSMSError e = error(() -> api.get("/calls/out/999"));
             ok(e != null && e.getHttp() == 404 && "not_found".equals(e.getCode()) && "Call not found".equals(e.getMessage()) && "no call 999".equals(e.getDetail())
                && "req-1".equals(e.getRequestId()) && "error".equals(e.getResponse().get("status")), "un 404: http, code, message, detail, X-Request-Id y la respuesta");
+            ok(e != null && e.getIdempotencyKey() == null, "un GET no lleva Idempotency-Key: null en el error");
             ok(e != null && e.toString().endsWith("Call not found (HTTP 404, code not_found, detail: no call 999, X-Request-Id req-1)"), "toString con el code (" + e + ")");
             MundoSMSError e2 = error(() -> api.post("/whatsapp/messages", MundoSMS.map("to", "1")));
             ok(e2 != null && e2.getHttp() == 200 && "whatsapp_rejected".equals(e2.getCode()) && "wam-1".equals(en(e2.getData(), "id")), "un 200 con status error es un error, con su code");
+            ok(e2 != null && e2.getIdempotencyKey() != null && e2.getIdempotencyKey().matches("[0-9a-f-]{36}")
+               && e2.getIdempotencyKey().equals(s.peticiones.get(1).cabeceras.get("idempotency-key")), "el error de un POST lleva la Idempotency-Key que usó");
             MundoSMSError e3 = error(() -> api.get("/calls"));
             ok(e3 != null && e3.getHttp() == 502 && e3.getCode() == null && "HTTP 502".equals(e3.getMessage()) && e3.getResponse() == null, "un 502 sin JSON: sin code");
             ok("unknown".equals(en(api.post("/whatsapp/messages", MundoSMS.map("to", "1")), "data", "state")), "el 202 de un WhatsApp sin confirmar no es un error");
@@ -278,6 +334,8 @@ public class MundoSMSTest {
             MundoSMSError e = error(() -> cliente(s, 0, 0.3).get("/calls"));
             ok(e != null && e.getHttp() == 0 && "No response from the API: timed out after 0.3 s".equals(e.getMessage())
                && System.currentTimeMillis() - t0 < 1200, "el plazo es de la petición entera");
+            MundoSMSError ep = error(() -> cliente(s, 0, 0.3).post("/sms", MundoSMS.map("to", "1"), new MundoSMS.RequestOptions().idempotencyKey("pedido-882")));
+            ok(ep != null && ep.getHttp() == 0 && "pedido-882".equals(ep.getIdempotencyKey()), "sin respuesta, el error de un POST lleva la clave con la que repetirlo");
         }
 
         System.out.println("== all recorre las páginas con su cursor");

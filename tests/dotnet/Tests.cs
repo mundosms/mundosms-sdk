@@ -2,6 +2,7 @@
 // contesta lo que pide cada caso. Sin paquetes. dotnet run -c Release; el código de salida es el número de fallos.
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
@@ -175,6 +176,13 @@ public static class Pruebas
         return new MundoSMSClient(Token, Clave) { BaseUrl = s.Base, Retries = reintentos, Timeout = TimeSpan.FromSeconds(plazo) };
     }
 
+    /// <summary>La respuesta de f o, si salta una MundoSMSException, una con status «error …»: el caso cuenta como fallo y las pruebas siguen.</summary>
+    static MundoSMSResponse EnMarcha(Func<MundoSMSResponse> f)
+    {
+        try { return f(); }
+        catch (MundoSMSException e) { var r = new MundoSMSResponse(); r["status"] = "error " + e.Http + " " + e.Code; return r; }
+    }
+
     static MundoSMSException Error(Action f)
     {
         try { f(); } catch (MundoSMSException e) { return e; }
@@ -218,18 +226,56 @@ public static class Pruebas
             Bien(e != null && e.Http == 500 && e.Code == "internal_error" && s.Peticiones.Count == 1, "un POST con 5xx no se repite");
         }
         // un 409 se decide por el code, no por el message: duplicated_request (cualquier método) y request_in_progress (un POST con su
-        // clave) se repiten; otro 409, aunque su message diga lo mismo, no
-        string[][] casos409 = { new[] { "GET", "duplicated_request", "Duplicated request", "3" }, new[] { "PATCH", "duplicated_request", "Duplicated request", "3" },
-                                new[] { "POST", "duplicated_request", "Duplicated request", "3" }, new[] { "POST", "request_in_progress", "Request in progress", "3" },
-                                new[] { "PATCH", "request_in_progress", "Request in progress", "1" }, new[] { "POST", "already_exists", "Request in progress", "1" } };
+        // clave) se repiten; otro 409, aunque su message diga lo mismo, no (el POST con request_in_progress, con Retry-After de una
+        // hora: más de lo que se espera, así que no se repite; lo que espera, en «409 request_in_progress»)
+        string[][] casos409 = { new[] { "GET", "duplicated_request", "Duplicated request", "3", "0" }, new[] { "PATCH", "duplicated_request", "Duplicated request", "3", "0" },
+                                new[] { "POST", "duplicated_request", "Duplicated request", "3", "0" }, new[] { "POST", "request_in_progress", "Request in progress", "1", "3600" },
+                                new[] { "PATCH", "request_in_progress", "Request in progress", "1", "0" }, new[] { "POST", "already_exists", "Request in progress", "1", "0" } };
         foreach (var c in casos409)
         {
             string b = "{\"status\":\"error\",\"code\":\"" + c[1] + "\",\"message\":\"" + c[2] + "\"}";
-            using (var s = new Servidor((n, p) => Respuesta.Json(409, b).Con("Retry-After", "0")))
+            using (var s = new Servidor((n, p) => Respuesta.Json(409, b).Con("Retry-After", c[4])))
             {
                 var e = Error(() => Cliente(s, 2).Request(c[0], "/x", new { a = 1 }));
                 Bien(e != null && e.Http == 409 && e.Code == c[1] && s.Peticiones.Count == int.Parse(c[3]), "409 " + c[1] + " en " + c[0] + ": " + c[3] + " petición(es)");
             }
+        }
+
+        Console.WriteLine("== 409 request_in_progress: se espera por tiempo, con la misma clave (2.1.0)");
+        // un corte (gasta el único reintento de Retries = 1) y tres 409 con Retry-After: 0 (se espera 1 s), y a la quinta, la respuesta
+        string enMarcha = "{\"status\":\"error\",\"code\":\"request_in_progress\",\"message\":\"Request in progress\"}";
+        using (var s = new Servidor((n, p) => n == 1 ? null : n < 5 ? Respuesta.Json(409, enMarcha).Con("Retry-After", "0") : Respuesta.Json(200, Ok)))
+        {
+            var t0 = DateTime.UtcNow;
+            var r = EnMarcha(() => Cliente(s, 1).Post("/whatsapp/messages", new { to = "1" }));
+            double t = (DateTime.UtcNow - t0).TotalSeconds;
+            List<Peticion> ps;
+            lock (s.Peticiones) ps = s.Peticiones.ToList();
+            Bien((string)r["status"] == "success" && ps.Count == 5 && ps.Select(x => x.Cabeceras.ContainsKey("Idempotency-Key") ? x.Cabeceras["Idempotency-Key"] : null).Distinct().Count() == 1
+                 && ps[0].Cabeceras.ContainsKey("Idempotency-Key") && ps.Select(x => x.Cabeceras["X-Timestamp"]).Distinct().Count() == 5 && t >= 3 && t < 8,
+                 "un corte y tres 409 con Retries 1: 5 peticiones con la misma clave y la respuesta (" + t.ToString("0.0", CultureInfo.InvariantCulture) + " s)");
+        }
+        using (var s = new Servidor((n, p) => n < 3 ? Respuesta.Json(409, enMarcha) : Respuesta.Json(200, Ok)))
+        {
+            var t0 = DateTime.UtcNow;
+            var r = EnMarcha(() => Cliente(s, 1).Post("/sms", new { to = "1" }));
+            double t = (DateTime.UtcNow - t0).TotalSeconds;
+            Bien((string)r["status"] == "success" && s.Peticiones.Count == 3 && t >= 3 && t < 6,
+                 "sin Retry-After: 1 y 2 s (" + t.ToString("0.0", CultureInfo.InvariantCulture) + " s)");
+        }
+        using (var s = new Servidor((n, p) => Respuesta.Json(409, enMarcha).Con("Retry-After", "3600")))
+        {
+            var t0 = DateTime.UtcNow;
+            var e = Error(() => Cliente(s, 1).Post("/sms", new { to = "1" }, new MundoSMSRequestOptions { IdempotencyKey = "pedido-881" }));
+            double t = (DateTime.UtcNow - t0).TotalSeconds;
+            Bien(e != null && e.Http == 409 && e.Code == "request_in_progress" && e.IdempotencyKey == "pedido-881" && s.Peticiones.Count == 1 && t < 1,
+                 "Retry-After pide más de lo que queda: no espera, y el error lleva la clave (" + t.ToString("0.0", CultureInfo.InvariantCulture) + " s)");
+        }
+        using (var s = new Servidor((n, p) => Respuesta.Json(409, enMarcha).Con("Retry-After", "0")))
+        {
+            var e = Error(() => Cliente(s, 0).Post("/sms", new { to = "1" }));
+            Bien(e != null && s.Peticiones.Count == 1 && e.IdempotencyKey != null && e.IdempotencyKey == s.Peticiones[0].Cabeceras["Idempotency-Key"],
+                 "con Retries 0, ninguno; y la clave puesta por el SDK, en el error");
         }
 
         Console.WriteLine("== los campos del error");
@@ -244,8 +290,11 @@ public static class Pruebas
             Bien(e != null && e.Http == 404 && e.Code == "not_found" && e.Message == "Call not found" && e.Detail == "no call 999" && e.RequestId == "req-1"
                  && (string)e.Response["status"] == "error" && typeof(MundoSMSException).GetProperty("StatusCode") == null,
                  "un 404: Http, Code, Message, Detail, RequestId y Response");
+            Bien(e != null && e.IdempotencyKey == null, "un GET no lleva Idempotency-Key: null en el error");
             var e2 = Error(() => api.Post("/whatsapp/messages", new { to = "1" }));
             Bien(e2 != null && e2.Http == 200 && e2.Code == "whatsapp_rejected" && (string)e2.Data["id"] == "wam-1", "un 200 con status error es un error, con su Code");
+            Bien(e2 != null && e2.IdempotencyKey != null && Regex.IsMatch(e2.IdempotencyKey, "^[0-9a-f-]{36}$") && e2.IdempotencyKey == s.Peticiones[1].Cabeceras["Idempotency-Key"],
+                 "el error de un POST lleva la Idempotency-Key que usó");
             var e3 = Error(() => api.Get("/calls"));
             Bien(e3 != null && e3.Http == 502 && e3.Code == null && e3.Message == "HTTP 502" && e3.Response == null, "un 502 sin JSON: sin Code");
             Bien((string)api.Post("/whatsapp/messages", new { to = "1" }).Data["state"] == "unknown", "el 202 de un WhatsApp sin confirmar no es un error");
@@ -256,6 +305,8 @@ public static class Pruebas
             var e = Error(() => Cliente(s, 0, 0.3).Get("/calls"));
             Bien(e != null && e.Http == 0 && e.Message == "No response from the API: timed out after 0.3 s" && e.InnerException != null
                  && (DateTime.UtcNow - t0).TotalSeconds < 1.2, "el plazo es de la petición entera (con la excepción de debajo)");
+            var ep = Error(() => Cliente(s, 0, 0.3).Post("/sms", new { to = "1" }, new MundoSMSRequestOptions { IdempotencyKey = "pedido-882" }));
+            Bien(ep != null && ep.Http == 0 && ep.IdempotencyKey == "pedido-882", "sin respuesta, el error de un POST lleva la clave con la que repetirlo");
         }
 
         Console.WriteLine("== All recorre las páginas con su cursor");

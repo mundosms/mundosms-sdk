@@ -25,7 +25,8 @@
 // bool y nil. Con [Response.Decode] lo pasas a tus propios tipos.
 //
 // Errores: un *[Error] con HTTP (el código HTTP), Code (la palabra de la API: "not_found", "invalid_parameter"…), Message,
-// Detail, Data, Response (la respuesta entera) y RequestID (la cabecera X-Request-Id); se saca con errors.As. También cuando la API contesta con
+// Detail, Data, Response (la respuesta entera), RequestID (la cabecera X-Request-Id) e IdempotencyKey (la Idempotency-Key que
+// llevó la petición: la de un POST, para repetirlo tú con la misma); se saca con errors.As. También cuando la API contesta con
 // "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la
 // respuesta, con data["state"] "unknown". Lo que no se puede mandar (una Idempotency-Key mal formada, un cuerpo que no
 // se puede pasar a JSON) es un error que envuelve a [ErrInvalidArgument], y no se manda nada.
@@ -34,6 +35,11 @@
 // api.Post(ctx, path, data, mundosms.IdempotencyKey("pedido-881"))). Por eso un POST que falla por la red, o con 409
 // request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera
 // vez, trae "idempotent_replayed": true ([Response.IdempotentReplayed]).
+//
+// Un 409 request_in_progress (la primera petición con esa clave aún se está haciendo: un WhatsApp con un fichero puede
+// tardar 2 o 3 minutos) se repite con la misma clave hasta 180 s desde el primero, sin contar en Retries: espera lo que diga
+// Retry-After (al menos 1 s) o 1, 2, 4, 8 y luego 15 s. Si Retry-After pide más de lo que queda, o se acaban los 180 s, es
+// un *[Error] con su IdempotencyKey: repítelo más tarde con ella. Con Retries(0), no se repite.
 //
 // Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un
 // POST con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así
@@ -73,14 +79,21 @@ import (
 
 const (
 	// Version es la versión del SDK (va en la cabecera User-Agent).
-	Version = "2.0.0"
+	Version = "2.1.0"
 	// DefaultBaseURL es la dirección de la API.
 	DefaultBaseURL = "https://api.mundosms.es/v3"
 	// WebhookTolerance es lo más que puede alejarse de tu hora la «t» de la firma de un aviso.
 	WebhookTolerance = 300 * time.Second
 	// maxRetryWait es lo más que se espera antes de un reintento, aunque Retry-After pida más.
 	maxRetryWait = 60 * time.Second
+	// inProgressStep es lo más que se espera entre dos intentos de un POST que sigue en marcha (409 request_in_progress) si
+	// la API no manda Retry-After.
+	inProgressStep = 15 * time.Second
 )
+
+// inProgressWait es lo más que se espera, con la misma Idempotency-Key, a un POST que sigue en marcha (409
+// request_in_progress), desde el primero de esos 409. Es una variable solo para que las pruebas lo puedan bajar.
+var inProgressWait = 180 * time.Second
 
 // ErrInvalidArgument lo envuelve el error de lo que no se puede mandar: una opción con un valor que no vale, una
 // Idempotency-Key mal formada, un cuerpo que no se puede pasar a JSON o un filtro de un tipo que no va en la query. En
@@ -140,14 +153,15 @@ func (r Response) Decode(v any) error {
 // Error es el error de cualquier petición: un 4xx o un 5xx, una respuesta 2xx con "status": "error" o, sin respuesta (la
 // red, el plazo agotado o el contexto cancelado), HTTP 0 y un Message que empieza por «No response from the API:».
 type Error struct {
-	HTTP      int            // el código HTTP; 0 si no hubo respuesta
-	Code      string         // el code de la API ("not_found", "invalid_parameter"…); "" si la respuesta no lo trae
-	Message   string         // el message de la API ("Call not found"…) o el del SDK
-	Detail    string         // el detail de la respuesta, si lo trae
-	Data      map[string]any // el data de la respuesta (en WhatsApp, el id del mensaje que puede haber salido)
-	Response  map[string]any // la respuesta entera, decodificada; nil si no era JSON
-	RequestID string         // la cabecera X-Request-Id: con ella encuentras la petición en Logs API
-	cause     error          // sin respuesta: la causa (la red, el plazo o el contexto)
+	HTTP           int            // el código HTTP; 0 si no hubo respuesta
+	Code           string         // el code de la API ("not_found", "invalid_parameter"…); "" si la respuesta no lo trae
+	Message        string         // el message de la API ("Call not found"…) o el del SDK
+	Detail         string         // el detail de la respuesta, si lo trae
+	Data           map[string]any // el data de la respuesta (en WhatsApp, el id del mensaje que puede haber salido)
+	Response       map[string]any // la respuesta entera, decodificada; nil si no era JSON
+	RequestID      string         // la cabecera X-Request-Id: con ella encuentras la petición en Logs API
+	IdempotencyKey string         // la Idempotency-Key que llevó la petición (la de un POST: la tuya o la del SDK); "" si no llevó
+	cause          error          // sin respuesta: la causa (la red, el plazo o el contexto)
 }
 
 func (e *Error) Error() string {
@@ -453,22 +467,34 @@ func (c *Client) do(ctx context.Context, method, path string, data any, opts []R
 	if _, err := http.NewRequest(method, target, nil); err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
-	afterNetwork := false // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
+	afterNetwork := false      // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
+	var inProgress []time.Time // cuándo llegó cada 409 request_in_progress de esta llamada (con reloj monotónico)
 	for attempt := 1; ; attempt++ {
 		status, header, resp, netErr := c.send(ctx, method, target, signedPath, timestamp(), idemKey, body)
 		if netErr != nil && ctx.Err() != nil { // tu contexto: ni se reintenta ni se espera
 			c.setRateLimit(nil)
-			return nil, nil, &Error{Message: "No response from the API: " + ctx.Err().Error(), cause: ctx.Err()}
+			return nil, nil, &Error{Message: "No response from the API: " + ctx.Err().Error(), IdempotencyKey: idemKey, cause: ctx.Err()}
 		}
 		var j map[string]any
 		isJSON := false
 		if netErr == nil && (status < 300 || status >= 400) { // de una redirección no se lee nada
 			j, isJSON = decodeObject(resp)
 		}
-		r, err := result(method, afterNetwork, status, header, resp, netErr, j, isJSON)
-		if retryable(method, netErr != nil, status, j, idemKey) && attempt <= c.retries {
+		r, err := result(method, afterNetwork, status, header, resp, netErr, j, isJSON, idemKey)
+		var wait time.Duration
+		again := false
+		if c.retries > 0 && inProgressConflict(method, status, j, idemKey) {
+			now := time.Now()
+			inProgress = append(inProgress, now)
+			if wait, again = inProgressDelay(header.Get("Retry-After"), len(inProgress), inProgressWait-now.Sub(inProgress[0])); again {
+				attempt-- // la primera con esta clave sigue en marcha: se espera y se repite, sin gastar Retries
+			}
+		} else if retryable(method, netErr != nil, status, j, idemKey) && attempt <= c.retries {
 			afterNetwork = afterNetwork || netErr != nil || duplicated(status, j)
-			if cerr := sleep(ctx, retryWait(header.Get("Retry-After"), attempt)); cerr != nil {
+			wait, again = retryWait(header.Get("Retry-After"), attempt), true
+		}
+		if again {
+			if cerr := sleep(ctx, wait); cerr != nil {
 				// tu contexto cortó la espera: el error de este intento (un 429, la red…), y errors.Is ve tu contexto
 				if e, ok := err.(*Error); ok {
 					e.cause = errors.Join(cerr, e.cause)
@@ -517,9 +543,17 @@ func duplicated(status int, j map[string]any) bool {
 	return status == 409 && text(j["code"]) == "duplicated_request"
 }
 
-// result es lo que devuelve un intento: la respuesta, o el *Error (también sin respuesta, la red o el plazo). afterNetwork:
-// un intento de antes se quedó sin respuesta.
-func result(method string, afterNetwork bool, status int, header http.Header, resp []byte, netErr error, j map[string]any, isJSON bool) (Response, error) {
+// result es lo que devuelve un intento: la respuesta, o el *Error (también sin respuesta, la red o el plazo), con la
+// Idempotency-Key que llevó (idemKey). afterNetwork: un intento de antes se quedó sin respuesta.
+func result(method string, afterNetwork bool, status int, header http.Header, resp []byte, netErr error, j map[string]any, isJSON bool, idemKey string) (Response, error) {
+	r, err := response(method, afterNetwork, status, header, resp, netErr, j, isJSON)
+	if e, ok := err.(*Error); ok {
+		e.IdempotencyKey = idemKey
+	}
+	return r, err
+}
+
+func response(method string, afterNetwork bool, status int, header http.Header, resp []byte, netErr error, j map[string]any, isJSON bool) (Response, error) {
 	if netErr != nil {
 		return nil, &Error{Message: "No response from the API: " + netErr.Error(), cause: netErr}
 	}
@@ -672,12 +706,12 @@ func idempotencyKey(opts []RequestOption, method string) (string, error) {
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:], nil
 }
 
-// retryable dice si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un
-// DELETE, ante un fallo de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un
-// 5xx de un POST no: un 500 puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un
-// 503 no hizo nada, pero repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición
-// firmada llegó dos veces: la repitió algo entre medias, como hace el Transport de Go con una conexión que se cerró) es un
-// fallo de red más.
+// retryable dice si se puede repetir (hasta Retries veces): un 429 en cualquier método; un GET, ante un fallo de red o un
+// 5xx; un PATCH, un DELETE o un POST con su Idempotency-Key, ante un fallo de red. Un 5xx de un POST no: un 500 puede
+// haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero
+// repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó dos veces:
+// la repitió algo entre medias, como hace el Transport de Go con una conexión que se cerró) es un fallo de red más. El 409
+// request_in_progress va aparte (inProgressConflict): se espera por tiempo, no por intentos.
 func retryable(method string, network bool, status int, j map[string]any, idemKey string) bool {
 	if status == 429 {
 		return true
@@ -689,22 +723,51 @@ func retryable(method string, network bool, status int, j map[string]any, idemKe
 	case method == http.MethodPatch || method == http.MethodDelete:
 		return network
 	case idemKey != "":
-		return network || (status == 409 && text(j["code"]) == "request_in_progress")
+		return network
 	}
 	return false
+}
+
+// inProgressConflict: un 409 request_in_progress en un POST con su Idempotency-Key, la primera petición con esa clave aún
+// no ha terminado.
+func inProgressConflict(method string, status int, j map[string]any, idemKey string) bool {
+	return method == http.MethodPost && idemKey != "" && status == 409 && text(j["code"]) == "request_in_progress"
+}
+
+// inProgressDelay es lo que se espera antes de repetir, con la misma clave, un POST que sigue en marcha (tras su n-ésimo
+// 409 request_in_progress), y false si ya no se espera: lo que pida Retry-After (al menos 1 s y como mucho 60 s) o, sin él,
+// 1, 2, 4, 8 y luego 15 s. remaining: lo que queda de los 180 s. Si Retry-After pide más, o la espera no cabe, false.
+func inProgressDelay(retryAfter string, n int, remaining time.Duration) (time.Duration, bool) {
+	s, ok := retryAfterSeconds(retryAfter)
+	if !ok {
+		s = math.Min(math.Pow(2, float64(n-1)), inProgressStep.Seconds())
+	} else if s > remaining.Seconds() {
+		return 0, false
+	}
+	s = math.Max(1, math.Min(maxRetryWait.Seconds(), s))
+	if s > remaining.Seconds() {
+		return 0, false
+	}
+	return time.Duration(s * float64(time.Second)), true
+}
+
+// retryAfterSeconds son los segundos que pide Retry-After (segundos o fecha HTTP), y false si no viene o no se entiende.
+func retryAfterSeconds(retryAfter string) (float64, bool) {
+	if v := strings.TrimSpace(retryAfter); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && !math.IsNaN(f) {
+			return f, true
+		}
+		if t, err := http.ParseTime(v); err == nil {
+			return time.Until(t).Seconds(), true
+		}
+	}
+	return 0, false
 }
 
 // retryWait es lo que se espera antes del siguiente intento: lo que pida Retry-After (segundos o fecha HTTP), o 1, 2, 4…
 // s. Como mucho 60 s.
 func retryWait(retryAfter string, attempt int) time.Duration {
-	s, ok := 0.0, false
-	if v := strings.TrimSpace(retryAfter); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && !math.IsNaN(f) {
-			s, ok = f, true
-		} else if t, err := http.ParseTime(v); err == nil {
-			s, ok = time.Until(t).Seconds(), true
-		}
-	}
+	s, ok := retryAfterSeconds(retryAfter)
 	if !ok {
 		s = math.Pow(2, float64(attempt-1))
 	}

@@ -52,11 +52,14 @@ class Program
 - `All` (y `AllAsync`, con `await foreach`, en .NET 6 o superior) recorre todas las páginas de un listado y te da los
   elementos uno a uno. Al acabar, el último `next_cursor` queda en `LastCursor`. `LastRateLimit` es el cupo
   (`X-RateLimit-*`) de la última respuesta.
-- Cualquier error es una `MundoSMSException` con `Http`, `Code`, `Message`, `Detail`, `Data`, `RequestId` y
-  `Response` (la respuesta entera). Un WhatsApp sin confirmar (`202`, `data.state` `"unknown"`: puede haber salido) no es un
-  error: vuelve la respuesta, y no se reenvía.
+- Cualquier error es una `MundoSMSException` con `Http`, `Code`, `Message`, `Detail`, `Data`, `RequestId`, `Response` (la
+  respuesta entera) e `IdempotencyKey` (la `Idempotency-Key` que llevó la petición: la de un `POST`, para repetirlo con la
+  misma). Un WhatsApp sin confirmar (`202`, `data.state` `"unknown"`: puede haber salido) no es un error: vuelve la respuesta,
+  y no se reenvía.
 - Cada `POST` lleva una `Idempotency-Key`, la misma en todos sus intentos. La tuya (el id de tu pedido, por ejemplo):
-  `api.PostAsync(path, data, new MundoSMSRequestOptions { IdempotencyKey = "pedido-881" })`.
+  `api.PostAsync(path, data, new MundoSMSRequestOptions { IdempotencyKey = "pedido-881" })`. Si la API contesta `409`
+  `request_in_progress` (la primera con esa clave aún se está haciendo), el SDK espera y la repite con la misma clave hasta
+  180 s; si no termina, el error lleva `IdempotencyKey` para que la repitas más tarde.
 - Las redirecciones no se siguen nunca: la API no las usa, y una redirección llevaría tu firma y tus datos a otro servidor.
 - `MundoSMSClient.VerifyWebhook(secret, header, body)` comprueba la cabecera `X-MundoSMS-Signature` de un aviso que te llega,
   con el cuerpo tal cual llegó (los bytes): `true` o `false`.

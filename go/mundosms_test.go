@@ -271,7 +271,7 @@ func TestIdempotencyKey(t *testing.T) {
 		t.Errorf("la clave automática es un UUID v4: %q", k)
 	}
 	if r[1].Header.Get("Idempotency-Key") != k || r[1].Header.Get("X-Timestamp") <= r[0].Header.Get("X-Timestamp") || r[1].Header.Get("X-Signature") == r[0].Header.Get("X-Signature") {
-		t.Errorf("el reintento del 409 request_in_progress (inmediato: Retry-After 0) lleva la MISMA clave y otro X-Timestamp, y se firma otra vez")
+		t.Errorf("el reintento del 409 request_in_progress (Retry-After 0: al cabo de 1 s) lleva la MISMA clave y otro X-Timestamp, y se firma otra vez")
 	}
 	if r[2].Header.Get("Idempotency-Key") != "pedido-881" || r[3].Header.Get("Idempotency-Key") != "" {
 		t.Errorf("la tuya, tal cual; y un GET, sin clave (%q, %q)", r[2].Header.Get("Idempotency-Key"), r[3].Header.Get("Idempotency-Key"))
@@ -300,15 +300,20 @@ func TestRetries(t *testing.T) {
 		{"GET", "409", "duplicated_request", "Duplicated request", 3},
 		{"PATCH", "409", "duplicated_request", "Duplicated request (the same signed request arrived twice)", 3},
 		{"POST", "409", "duplicated_request", "Duplicated request", 3},
-		{"POST", "409", "request_in_progress", "Request in progress", 3},
+		{"POST", "409", "request_in_progress", "Request in progress", 1}, // con Retry-After de una hora: más de lo que se espera
 		{"PATCH", "409", "request_in_progress", "Request in progress", 1},
 		{"POST", "409", "already_exists", "Request in progress", 1},
 		{"GET", "404", "not_found", "Call not found", 1},
 		{"POST", "422", "idempotency_key_reused", "Idempotency-Key already used", 1},
 	}
+	defer withInProgressWait(3 * time.Second)() // si algún 409 se esperase sin deber, que se note en segundos
 	for _, tc := range cases {
+		ra := "0"
+		if tc.method == "POST" && tc.code == "request_in_progress" { // lo que espera, en TestInProgressWaitsByTime
+			ra = "3600"
+		}
 		s := newServer(t, func(_ int, _ *http.Request, w http.ResponseWriter) {
-			w.Header().Set("Retry-After", "0")
+			w.Header().Set("Retry-After", ra)
 			st, _ := strconv.Atoi(tc.status)
 			jsonReply(w, st, `{"status":"error","code":"`+tc.code+`","message":"`+tc.message+`"}`)
 		})
@@ -321,6 +326,136 @@ func TestRetries(t *testing.T) {
 		if n := len(s.requests()); n != tc.want {
 			t.Errorf("%s %s %s: %d peticiones, y tenían que ser %d", tc.method, tc.status, tc.code, n, tc.want)
 		}
+	}
+}
+
+// 2.1.0: un 409 request_in_progress se repite con la MISMA clave por tiempo (hasta 180 s desde el primero), no por intentos.
+func TestInProgressWaitsByTime(t *testing.T) {
+	const inProgress = `{"status":"error","code":"request_in_progress","message":"Request in progress"}`
+	ctx := context.Background()
+	// (a) un corte (gasta el único reintento de Retries(1)) y tres 409 con Retry-After: 0 (se espera como 1 s); a la quinta, la
+	// respuesta
+	s := newServer(t, func(n int, _ *http.Request, w http.ResponseWriter) {
+		switch {
+		case n == 1:
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		case n < 5:
+			w.Header().Set("Retry-After", "0")
+			jsonReply(w, 409, inProgress)
+		default:
+			jsonReply(w, 200, okBody)
+		}
+	})
+	t0 := time.Now()
+	if _, err := client(t, s, Retries(1)).Post(ctx, "/whatsapp/messages", Params{"to": "1"}); err != nil {
+		t.Fatalf("(a) %v", err)
+	}
+	el := time.Since(t0)
+	r := s.requests()
+	keys, stamps := map[string]bool{}, map[string]bool{}
+	for _, x := range r {
+		keys[x.Header.Get("Idempotency-Key")] = true
+		stamps[x.Header.Get("X-Timestamp")] = true
+	}
+	if len(r) != 5 || len(keys) != 1 || len(stamps) != 5 || el < 3*time.Second || el > 8*time.Second {
+		t.Errorf("(a) %d peticiones, %d claves, %d X-Timestamp, %v", len(r), len(keys), len(stamps), el)
+	}
+	// (b) sin Retry-After: 1 y 2 s
+	s = newServer(t, func(n int, _ *http.Request, w http.ResponseWriter) {
+		if n < 3 {
+			jsonReply(w, 409, inProgress)
+			return
+		}
+		jsonReply(w, 200, okBody)
+	})
+	t0 = time.Now()
+	if _, err := client(t, s, Retries(1)).Post(ctx, "/sms", Params{"to": "1"}); err != nil {
+		t.Fatalf("(b) %v", err)
+	}
+	if el := time.Since(t0); len(s.requests()) != 3 || el < 3*time.Second || el > 6*time.Second {
+		t.Errorf("(b) %d peticiones, %v", len(s.requests()), el)
+	}
+	// (c) Retry-After pide más de lo que queda de los 180 s: no espera; el error lleva la clave para repetirlo más tarde
+	s = newServer(t, func(_ int, _ *http.Request, w http.ResponseWriter) {
+		w.Header().Set("Retry-After", "3600")
+		jsonReply(w, 409, inProgress)
+	})
+	t0 = time.Now()
+	cctx, cancel := context.WithTimeout(ctx, 3*time.Second) // si esperase, que se note en segundos y no en minutos
+	_, err := client(t, s, Retries(1)).Post(cctx, "/sms", Params{"to": "1"}, IdempotencyKey("pedido-881"))
+	cancel()
+	var e *Error
+	if !errors.As(err, &e) || e.HTTP != 409 || e.Code != "request_in_progress" || e.IdempotencyKey != "pedido-881" || len(s.requests()) != 1 ||
+		errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("(c) %#v, %d peticiones", err, len(s.requests()))
+	}
+	if el := time.Since(t0); el > time.Second {
+		t.Errorf("(c) esperó %v", el)
+	}
+	// (d) con Retries(0), ninguno; y la clave puesta por el SDK, en el error
+	restore := withInProgressWait(3 * time.Second)
+	s = newServer(t, func(_ int, _ *http.Request, w http.ResponseWriter) {
+		w.Header().Set("Retry-After", "0")
+		jsonReply(w, 409, inProgress)
+	})
+	_, err = client(t, s, Retries(0)).Post(ctx, "/sms", Params{"to": "1"})
+	restore()
+	if r := s.requests(); !errors.As(err, &e) || len(r) != 1 || e.IdempotencyKey == "" || e.IdempotencyKey != r[0].Header.Get("Idempotency-Key") {
+		t.Errorf("(d) %#v, %d peticiones", err, len(r))
+	}
+	// (e) el tope (aquí, 2,5 s en vez de 180): tras dos esperas de 1 s, la tercera no cabe
+	defer withInProgressWait(2500 * time.Millisecond)()
+	s = newServer(t, func(_ int, _ *http.Request, w http.ResponseWriter) {
+		w.Header().Set("Retry-After", "0")
+		jsonReply(w, 409, inProgress)
+	})
+	cctx, cancel = context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	_, err = client(t, s).Post(cctx, "/sms", Params{"to": "1"})
+	if !errors.As(err, &e) || e.Code != "request_in_progress" || len(s.requests()) != 3 || errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("(e) %v, %d peticiones", err, len(s.requests()))
+	}
+}
+
+// withInProgressWait baja (o sube) el tope de la espera de request_in_progress; lo que devuelve lo deja como estaba.
+func withInProgressWait(d time.Duration) func() {
+	tope := inProgressWait
+	inProgressWait = d
+	return func() { inProgressWait = tope }
+}
+
+func TestInProgressDelay(t *testing.T) {
+	future := time.Now().Add(3 * time.Second).UTC().Format(http.TimeFormat)
+	cases := []struct {
+		header    string
+		n         int
+		remaining time.Duration
+		want      time.Duration
+		ok        bool
+	}{
+		{"", 1, 180 * time.Second, time.Second, true},
+		{"", 4, 180 * time.Second, 8 * time.Second, true},
+		{"", 9, 180 * time.Second, 15 * time.Second, true},
+		{"", 9, 10 * time.Second, 0, false},
+		{"0", 1, 180 * time.Second, time.Second, true},
+		{"-5", 1, 180 * time.Second, time.Second, true},
+		{"30", 1, 180 * time.Second, 30 * time.Second, true},
+		{"120", 1, 180 * time.Second, 60 * time.Second, true},
+		{"120", 1, 100 * time.Second, 0, false},
+		{"3600", 1, 180 * time.Second, 0, false},
+		{"NaN", 2, 180 * time.Second, 2 * time.Second, true},
+		{"0", 1, 500 * time.Millisecond, 0, false},
+	}
+	for _, tc := range cases {
+		if d, ok := inProgressDelay(tc.header, tc.n, tc.remaining); d != tc.want || ok != tc.ok {
+			t.Errorf("Retry-After %q, n %d, quedan %v: %v %v", tc.header, tc.n, tc.remaining, d, ok)
+		}
+	}
+	if d, ok := inProgressDelay(future, 1, 180*time.Second); !ok || d < time.Second || d > 3*time.Second {
+		t.Errorf("Retry-After con fecha: %v %v", d, ok)
 	}
 }
 
@@ -406,6 +541,9 @@ func TestNetworkErrorRetriesWithSameKey(t *testing.T) {
 	if len(keys) != 3 || keys[0] != keys[1] || keys[1] != keys[2] || !strings.HasPrefix(keys[0], "POST ") || len(keys[0]) < 30 {
 		t.Errorf("el POST sin respuesta se repite con la misma Idempotency-Key: %v", keys)
 	}
+	if len(keys) > 0 && "POST "+e.IdempotencyKey != keys[0] {
+		t.Errorf("2.1.0: sin respuesta, el error lleva la clave con la que repetirlo: %q (llegó %q)", e.IdempotencyKey, keys[0])
+	}
 }
 
 func TestTimeoutWholeRequest(t *testing.T) {
@@ -476,8 +614,8 @@ func TestErrors(t *testing.T) {
 	_, err := c.Get(ctx, "/calls/out/999", nil)
 	var e *Error
 	if !errors.As(err, &e) || e.HTTP != 404 || e.Code != "not_found" || e.Message != "Call not found" || e.Detail != "no call 999 of type out" ||
-		e.RequestID != "req-1" || e.Response["status"] != "error" || e.Unwrap() != nil {
-		t.Errorf("404: %#v", e)
+		e.RequestID != "req-1" || e.Response["status"] != "error" || e.Unwrap() != nil || e.IdempotencyKey != "" {
+		t.Errorf("404 (un GET no lleva clave): %#v", e)
 	}
 	if err.Error() != "mundosms: Call not found: no call 999 of type out (HTTP 404, code not_found)" {
 		t.Errorf("Error(): %q", err.Error())
@@ -485,6 +623,9 @@ func TestErrors(t *testing.T) {
 	_, err = c.Post(ctx, "/whatsapp/messages", Params{"to": "1"})
 	if !errors.As(err, &e) || e.HTTP != 200 || e.Code != "whatsapp_rejected" || e.Data["id"] != "wam-1" {
 		t.Errorf("un 200 con status error es un error: %v", err)
+	}
+	if k := s.requests()[1].Header.Get("Idempotency-Key"); e.IdempotencyKey == "" || e.IdempotencyKey != k {
+		t.Errorf("2.1.0: el error de un POST lleva la Idempotency-Key que usó: %q, y la cabecera era %q", e.IdempotencyKey, k)
 	}
 	_, err = c.Get(ctx, "/calls", nil)
 	if !errors.As(err, &e) || e.HTTP != 502 || e.Code != "" || e.Message != "HTTP 502" || e.Response != nil || e.RequestID != "req-3" {

@@ -11,12 +11,17 @@
  *   for await (const call of api.all("/calls", { from_datetime: "2026-11-01", stop_at_ongoing: true })) { ... }
  *
  * Errores: excepción MundoSMSError con .http (código HTTP), .code (la palabra de la API: "not_found", "invalid_parameter"…),
- * .message, .detail, .data, .response (la respuesta entera) y .requestId (la cabecera X-Request-Id). También cuando la API
+ * .message, .detail, .data, .response (la respuesta entera), .requestId (la cabecera X-Request-Id) e .idempotencyKey (la
+ * Idempotency-Key que llevó la petición: la de un POST, para repetirlo tú con la misma). También cuando la API
  * contesta con "status": "error", venga con el código HTTP que venga. Un WhatsApp sin confirmar (202) no es un error: vuelve la respuesta, con data.state "unknown".
  * Cada POST lleva una Idempotency-Key (un UUID nuevo en cada llamada, la misma en todos sus intentos; la tuya, con
  * api.post(path, data, { idempotencyKey: "pedido-881" })). Por eso un POST que falla por la red, o con 409
  * request_in_progress, se repite sin miedo: la API no lo hace dos veces. Si la respuesta es la guardada de la primera vez, trae
  * idempotent_replayed: true.
+ * Un 409 request_in_progress (la primera petición con esa clave aún se está haciendo: un WhatsApp con un fichero puede tardar
+ * 2 o 3 minutos) se repite con la misma clave hasta IN_PROGRESS_WAIT (180 s) desde el primero, sin contar en retries: espera
+ * lo que diga Retry-After (al menos 1 s) o 1, 2, 4, 8 y luego 15 s. Si Retry-After pide más de lo que queda, o se acaban los
+ * 180 s, es un MundoSMSError con su .idempotencyKey: repítelo más tarde con ella. Con retries 0, no se repite.
  * Reintenta: un 429, en cualquier método (no se hizo nada); un fallo de red, en cualquier método; un 5xx, solo en GET (un POST
  * con 5xx no se repite: un 500 puede llegar con la operación hecha, y la API lo guarda con la Idempotency-Key, así que
  * repetirlo con ella devolvería el mismo 500; un 503 no hizo nada, y puedes repetirlo tú con la misma clave). Espera lo que
@@ -30,8 +35,10 @@
 "use strict";
 const crypto = require("crypto");
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const MAX_RETRY_WAIT = 60; // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
+const IN_PROGRESS_WAIT = 180; // segundos: lo más que se espera, con la misma Idempotency-Key, a un POST que sigue en marcha (409 request_in_progress)
+const IN_PROGRESS_STEP = 15; // segundos: lo más que se espera entre dos intentos de ese POST si la API no manda Retry-After
 const WEBHOOK_TOLERANCE = 300; // segundos: lo más que puede alejarse de tu hora la «t» de la firma de un aviso
 const CLIENT_OPTIONS = ["baseUrl", "retries", "timeout"];
 const FILE_TYPES = /^(audio\/|image\/|application\/pdf$|application\/octet-stream$)/; // lo que la API da como fichero
@@ -40,7 +47,7 @@ const NOT_PAGINATED = "MundoSMS: all() cannot go through %s: it has more (has_mo
 let lastTimestamp = 0; // el X-Timestamp de la última petición de este proceso (milisegundos)
 
 class MundoSMSError extends Error {
-  constructor(message, http = 0, code = null, detail = null, response = null, data = null, requestId = null) {
+  constructor(message, http = 0, code = null, detail = null, response = null, data = null, requestId = null, idempotencyKey = null) {
     super(message);
     this.name = "MundoSMSError";
     this.http = http;
@@ -49,6 +56,7 @@ class MundoSMSError extends Error {
     this.response = response;
     this.data = data;
     this.requestId = requestId;
+    this.idempotencyKey = idempotencyKey; // la Idempotency-Key que llevó la petición (la de un POST); null si no llevó
   }
 }
 
@@ -152,6 +160,7 @@ class MundoSMS {
     const url = this.baseUrl + encodedPath + (query ? "?" + query : "");
     const signedPath = new URL(url).pathname + (query ? "?" + query : ""); // lo que se firma es justo lo que se manda
     let afterNetwork = false; // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
+    const inProgress = []; // cuándo llegó cada 409 request_in_progress de esta llamada (reloj monotónico, en segundos)
     for (let attempt = 1; ; attempt++) {
       const ts = timestamp(); // dos peticiones iguales a la vez, o un reintento inmediato, no firman igual
       const headers = { Authorization: "Bearer " + this.#token, "X-Timestamp": ts, Accept: "application/json", "User-Agent": "MundoSMS-Node/" + VERSION };
@@ -182,27 +191,36 @@ class MundoSMS {
       }
       const isJson = j !== null && typeof j === "object" && !Array.isArray(j);
       if (!isJson) j = null;
-      if (retryable(method, !!networkError, http, j, idemKey) && attempt <= this.retries) {
+      if (this.retries > 0 && inProgressCode(method, http, j, idemKey)) {
+        inProgress.push(performance.now() / 1000);
+        const wait = inProgressWait(r.headers.get("retry-after"), inProgress.length,
+                                    IN_PROGRESS_WAIT - (inProgress[inProgress.length - 1] - inProgress[0]));
+        if (wait !== null) { // la primera con esta clave sigue en marcha: se espera y se repite, sin gastar retries
+          attempt--;
+          await new Promise((ok) => setTimeout(ok, wait * 1000));
+          continue;
+        }
+      } else if (retryable(method, !!networkError, http, j, idemKey) && attempt <= this.retries) {
         afterNetwork = afterNetwork || !!networkError || duplicated(http, j);
         await new Promise((ok) => setTimeout(ok, retryWait(r && r.headers.get("retry-after"), attempt) * 1000));
         continue;
       }
       if (networkError) {
         this.lastRateLimit = null;
-        const err = new MundoSMSError("No response from the API: " + networkError);
+        const err = new MundoSMSError("No response from the API: " + networkError, 0, null, null, null, null, null, idemKey);
         if (cause) err.cause = cause;
         throw err;
       }
       this.lastRateLimit = rateLimit(r.headers);
       const rid = r.headers.get("x-request-id");
-      if (redirect) throw new MundoSMSError(redirected(http, r.headers.get("location")), http, null, null, null, null, rid);
+      if (redirect) throw new MundoSMSError(redirected(http, r.headers.get("location")), http, null, null, null, null, rid, idemKey);
       const replayed = String(r.headers.get("idempotent-replayed") || "").trim().toLowerCase() === "true";
       if (replayed && isJson) j.idempotent_replayed = true; // la respuesta guardada de la primera vez: no se ha vuelto a hacer
       if (http >= 200 && http < 300) {
         if (!isJson) { // un fichero, o algo que no es de la API
           if (resp.length && !FILE_TYPES.test(contentType.split(";")[0].trim().toLowerCase())) {
             throw new MundoSMSError("HTTP " + http + ": the response is not JSON (" + (contentType.split(";")[0].trim() || "no Content-Type") + ")",
-                                    http, null, null, null, null, rid);
+                                    http, null, null, null, null, rid, idemKey);
           }
           const file = { status: "success", content_type: contentType, body: resp };
           if (replayed) file.idempotent_replayed = true;
@@ -214,8 +232,8 @@ class MundoSMS {
         // lo borró el intento que se quedó sin respuesta
         return { status: "success", message: "Already deleted", data: { state: "deleted", changed: false } };
       }
-      if (isJson) throw new MundoSMSError(j.message || "Error", http, code(j), j.detail ?? null, j, j.data ?? null, rid);
-      throw new MundoSMSError("HTTP " + http, http, null, null, null, null, rid);
+      if (isJson) throw new MundoSMSError(j.message || "Error", http, code(j), j.detail ?? null, j, j.data ?? null, rid, idemKey);
+      throw new MundoSMSError("HTTP " + http, http, null, null, null, null, rid, idemKey);
     }
   }
 
@@ -282,19 +300,38 @@ function idempotencyKey(options, method) {
 }
 
 /**
- * Si se puede repetir: un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH o un DELETE, ante un fallo
- * de red; un POST (con su Idempotency-Key), ante un fallo de red o un 409 request_in_progress. Un 5xx de un POST no: un 500
- * puede haberse hecho y la API lo guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero
- * repetirlo con la misma clave se deja a tu código. Un 409 duplicated_request (la MISMA petición firmada llegó dos veces: la
- * repitió algo entre medias, como hace un cliente HTTP con una conexión que se cerró) es un fallo de red más.
+ * Si se puede repetir (hasta retries veces): un 429 en cualquier método; un GET, ante un fallo de red o un 5xx; un PATCH, un
+ * DELETE o un POST con su Idempotency-Key, ante un fallo de red. Un 5xx de un POST no: un 500 puede haberse hecho y la API lo
+ * guarda con la clave (repetirlo devolvería el mismo 500), y un 503 no hizo nada, pero repetirlo con la misma clave se deja a
+ * tu código. Un 409 duplicated_request (la MISMA petición firmada llegó dos veces: la repitió algo entre medias, como hace un
+ * cliente HTTP con una conexión que se cerró) es un fallo de red más. El 409 request_in_progress va aparte (inProgressCode):
+ * se espera por tiempo, no por intentos.
  */
 function retryable(method, network, http, j, idemKey) {
   if (http === 429) return true;
   network = network || duplicated(http, j);
   if (method === "GET") return network || http >= 500;
   if (method === "PATCH" || method === "DELETE") return network;
-  if (idemKey) return network || (http === 409 && code(j) === "request_in_progress");
+  if (idemKey) return network;
   return false;
+}
+
+/** 409 request_in_progress en un POST con su Idempotency-Key: la primera petición con esa clave aún no ha terminado. */
+function inProgressCode(method, http, j, idemKey) {
+  return method === "POST" && !!idemKey && http === 409 && code(j) === "request_in_progress";
+}
+
+/**
+ * Segundos antes de repetir, con la misma clave, un POST que sigue en marcha (tras su n-ésimo 409 request_in_progress), o null
+ * si ya no se espera: lo que pida Retry-After (al menos 1 s y como mucho MAX_RETRY_WAIT) o, sin él, 1, 2, 4, 8 y luego
+ * IN_PROGRESS_STEP. remaining: lo que queda de IN_PROGRESS_WAIT. Si Retry-After pide más, o la espera no cabe, null.
+ */
+function inProgressWait(retryAfter, n, remaining) {
+  let s = retryAfterSeconds(retryAfter);
+  if (s === null) s = Math.min(2 ** (n - 1), IN_PROGRESS_STEP);
+  else if (s > remaining) return null;
+  s = Math.max(1, Math.min(MAX_RETRY_WAIT, s));
+  return s <= remaining ? s : null;
 }
 
 /** 409 duplicated_request: la MISMA petición firmada llegó dos veces (la repitió algo entre medias). */
@@ -382,14 +419,17 @@ function percentDecode(s) {
   return Buffer.from(bytes).toString("utf8");
 }
 
+/** Los segundos que pide Retry-After (segundos o fecha HTTP), o null si no viene o no se entiende. */
+function retryAfterSeconds(retryAfter) {
+  if (!retryAfter) return null;
+  const n = Number(retryAfter);
+  const s = Number.isFinite(n) ? n : (Date.parse(retryAfter) - Date.now()) / 1000;
+  return Number.isFinite(s) ? s : null;
+}
+
 /** Segundos antes del siguiente intento: lo que pida Retry-After (segundos o fecha HTTP), o 1, 2, 4… Como mucho 60. */
 function retryWait(retryAfter, attempt) {
-  let s = null;
-  if (retryAfter) {
-    const n = Number(retryAfter);
-    s = Number.isFinite(n) ? n : (Date.parse(retryAfter) - Date.now()) / 1000;
-    if (!Number.isFinite(s)) s = null;
-  }
+  let s = retryAfterSeconds(retryAfter);
   if (s === null) s = 2 ** (attempt - 1);
   return Math.max(0, Math.min(MAX_RETRY_WAIT, s));
 }
