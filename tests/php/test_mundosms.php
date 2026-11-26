@@ -1,7 +1,7 @@
 <?php
 /**
  * Pruebas del cliente PHP (mundosms.php), sin red: un servidor de prueba local (otro proceso de PHP, con stream_socket_server)
- * que comprueba la firma como la API y contesta lo que le pide cada caso. PHP 7.4 o superior, con curl; sin dependencias.
+ * que comprueba la firma como la API y contesta lo que le pide cada caso. PHP 7.0 o superior, con curl; sin dependencias.
  *   php tests/php/test_mundosms.php          (el código de salida es el número de fallos)
  */
 error_reporting(E_ALL);
@@ -65,7 +65,7 @@ while (true) {
 PHP
 );
 @unlink("$dir/puerto");
-$proc = proc_open(array(PHP_BINARY, "$dir/servidor.php", $dir), array(), $tubos);
+$proc = proc_open(escapeshellarg(PHP_BINARY) . " " . escapeshellarg("$dir/servidor.php") . " " . escapeshellarg($dir), array(), $tubos);   // la orden como texto: con array, solo desde PHP 7.4
 for ($i = 0; $i < 100 && !is_file("$dir/puerto"); $i++) usleep(50000);
 $base = "http://127.0.0.1:" . trim((string) @file_get_contents("$dir/puerto")) . "/v3";
 
@@ -185,6 +185,24 @@ $e = error(function () { cliente(array("retries" => 0))->post("/sms", array("to"
 $ps = peticiones();
 ok($e && count($ps) === 1 && $e->idempotencyKey !== null && $e->idempotencyKey === ($ps[0]["cabeceras"]["idempotency-key"] ?? ""),
    "con retries 0, ninguno; y la clave puesta por el SDK, en el error");
+
+echo "== 409 en marcha con un reloj que retrocede: la espera para a los 180 s dormidos (2.1.1)\n";
+// sin hrtime (antes de PHP 7.3) el reloj es la hora del sistema: si retrocede, «lo que ha pasado» sale negativo y la espera se
+// alargaría lo que retroceda. La cota cuenta también lo dormido. Aquí el reloj retrocede 60 s en cada consulta y la pausa no duerme.
+class RelojAtras extends MundoSMS
+{
+    public static $t = 100000.0;
+    public static $dormido = array();
+    protected static function now() { self::$t -= 60; return self::$t; }
+    protected static function pause($s) { self::$dormido[] = $s; }
+}
+plan(array_fill(0, 40, $en0));
+$t0 = microtime(true);
+$e = error(function () use ($base) { (new RelojAtras(TOKEN, KEY, array("baseUrl" => $base, "retries" => 1)))->post("/sms", array("to" => "1"), array("idempotencyKey" => "pedido-883")); });
+$suma = array_sum(RelojAtras::$dormido);
+ok($e && $e->http === 409 && $e->code === "request_in_progress" && $e->idempotencyKey === "pedido-883" && $suma <= 180 && $suma >= 165
+   && count(peticiones()) === count(RelojAtras::$dormido) + 1 && microtime(true) - $t0 < 10,
+   sprintf("el reloj retrocede: para a los %d s dormidos (%d esperas, %d peticiones), con el error y la clave", $suma, count(RelojAtras::$dormido), count(peticiones())));
 
 echo "== los campos del error\n";
 plan(array(json(404, '{"status":"error","code":"not_found","message":"Call not found","detail":"no call 999"}', array("X-Request-Id" => "req-1")),

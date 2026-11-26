@@ -35,7 +35,7 @@
 "use strict";
 const crypto = require("crypto");
 
-const VERSION = "2.1.0";
+const VERSION = "2.1.1";
 const MAX_RETRY_WAIT = 60; // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
 const IN_PROGRESS_WAIT = 180; // segundos: lo más que se espera, con la misma Idempotency-Key, a un POST que sigue en marcha (409 request_in_progress)
 const IN_PROGRESS_STEP = 15; // segundos: lo más que se espera entre dos intentos de ese POST si la API no manda Retry-After

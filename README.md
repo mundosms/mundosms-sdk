@@ -8,7 +8,7 @@ firma de los avisos que te mandamos ([Comprobar los avisos](#comprobar-los-aviso
 
 | Lenguaje | Fichero | Requisitos |
 |---|---|---|
-| PHP | [`php/mundosms.php`](php/mundosms.php) | PHP 7.4 o superior, con la extensión curl |
+| PHP | [`php/mundosms.php`](php/mundosms.php) | PHP 7.0 o superior, con la extensión curl |
 | Python | [`python/mundosms.py`](python/mundosms.py) | Python 3.9 o superior |
 | Node.js | [`node/mundosms.js`](node/mundosms.js) (y [`node/mundosms.d.ts`](node/mundosms.d.ts), los tipos de TypeScript) | Node.js 18 o superior |
 | Java | [`java/MundoSMS.java`](java/MundoSMS.java) (el paquete `es.mundosms:mundosms-sdk` de Maven Central) | Java 8 o superior |

@@ -106,7 +106,7 @@ import javax.crypto.spec.SecretKeySpec;
 public class MundoSMS {
 
     /** La versión de este cliente: va también en el User-Agent. */
-    public static final String VERSION = "2.1.0";
+    public static final String VERSION = "2.1.1";
 
     /** Los segundos que puede alejarse de tu hora la «t» de la firma de un aviso, si no dices otra cosa. */
     public static final long WEBHOOK_TOLERANCE = 300;

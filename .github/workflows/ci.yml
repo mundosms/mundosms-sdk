@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        imagen: ["php:7.4.33-cli", "php:8.5.12-cli"]
+        imagen: ["php:7.0.33-cli", "php:7.2.34-cli", "php:7.4.33-cli", "php:8.5.12-cli"]
     env:
       IMAGEN: ${{ matrix.imagen }}
     steps:

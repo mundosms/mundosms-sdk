@@ -79,7 +79,7 @@ import (
 
 const (
 	// Version es la versión del SDK (va en la cabecera User-Agent).
-	Version = "2.1.0"
+	Version = "2.1.1"
 	// DefaultBaseURL es la dirección de la API.
 	DefaultBaseURL = "https://api.mundosms.es/v3"
 	// WebhookTolerance es lo más que puede alejarse de tu hora la «t» de la firma de un aviso.

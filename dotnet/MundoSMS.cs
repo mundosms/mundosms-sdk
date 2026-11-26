@@ -206,7 +206,7 @@ namespace MundoSMS
     public class MundoSMSClient
     {
         /// <summary>La versión del SDK.</summary>
-        public const string Version = "2.1.0";
+        public const string Version = "2.1.1";
 
         /// <summary>Los segundos que puede alejarse de tu hora la «t» de la firma de un aviso, si no dices otra cosa.</summary>
         public const long WebhookTolerance = 300;

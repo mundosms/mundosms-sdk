@@ -1,5 +1,12 @@
 # Cambios
 
+## v2.1.1
+
+- **PHP: funciona desde PHP 7.0.** Hasta la 2.1.0 pedía PHP 7.4 y, por debajo de 7.3, fallaba en cuanto un `POST`
+  seguía en marcha (`hrtime()`, el reloj que mide esa espera, no existe antes de 7.3). Ahora usa `hrtime()` si existe y,
+  si no, `microtime()`; y los 180 segundos de esa espera cuentan también lo dormido, así que no se alargan aunque la
+  hora del servidor retroceda. El resto de lenguajes no cambia.
+
 ## v2.1.0
 
 Solo se añaden cosas: tu código de la 2.0 sigue funcionando igual.

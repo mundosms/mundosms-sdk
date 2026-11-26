@@ -1,6 +1,6 @@
 <?php
 /**
- * MundoSMS API v3 — cliente PHP en un solo fichero (PHP 7.4 o superior, con la extensión curl). Sin dependencias.
+ * MundoSMS API v3 — cliente PHP en un solo fichero (PHP 7.0 o superior, con la extensión curl). Sin dependencias.
  * Documentación: https://www.mundosms.es/api-v3
  * Código y versiones: https://github.com/mundosms/mundosms-sdk (licencia MIT)
  *
@@ -67,7 +67,7 @@ class MundoSMSError extends Exception
 
 class MundoSMS
 {
-    const VERSION = "2.1.0";
+    const VERSION = "2.1.1";
     const MAX_RETRY_WAIT = 60;      // segundos: lo más que se espera antes de un reintento, aunque Retry-After pida más
     const IN_PROGRESS_WAIT = 180;   // segundos: lo más que se espera, con la misma Idempotency-Key, a un POST que sigue en marcha (409 request_in_progress)
     const IN_PROGRESS_STEP = 15;    // segundos: lo más que se espera entre dos intentos de ese POST si la API no manda Retry-After
@@ -110,7 +110,7 @@ class MundoSMS
         #[\SensitiveParameter]
         $privateKey = "",
         array $options = array()
-    ) {   // cada atributo en su línea: en PHP 7.4, «#[» es un comentario hasta el final de la línea
+    ) {   // cada atributo en su línea: en PHP 7, «#[» es un comentario hasta el final de la línea
         foreach ($options as $k => $v) {
             if (!in_array($k, array("baseUrl", "retries", "timeout"), true)) {
                 throw new InvalidArgumentException('MundoSMS: unknown option "' . $k . '" (options: baseUrl, retries, timeout)');
@@ -244,6 +244,7 @@ class MundoSMS
         $attempt = 0;
         $afterNetwork = false;   // un intento de antes se quedó sin respuesta (o llegó dos veces): puede que se hiciera
         $inProgress = array();   // cuándo llegó cada 409 request_in_progress de esta llamada (reloj monotónico, en segundos)
+        $inProgressSlept = 0;    // lo dormido esperando ese POST: la cota de los 180 s aunque el reloj retroceda (sin hrtime, antes de PHP 7.3)
         while (true) {
             $attempt++;
             $ts = self::timestamp();   // un reintento inmediato no firma igual que el intento de antes
@@ -276,17 +277,18 @@ class MundoSMS
             $j = ($resp !== false && $networkError === "" && !$redirect) ? json_decode((string) $resp, true) : null;
             if (!is_array($j) || ($j !== array() && self::isList($j))) $j = null;   // solo un objeto JSON es de la API
             if ($this->retries > 0 && self::inProgress($method, $http, $j, $idemKey)) {
-                $inProgress[] = hrtime(true) / 1e9;
+                $inProgress[] = static::now();
                 $s = self::inProgressWait($respHeaders["retry-after"] ?? null, count($inProgress),
-                                          self::IN_PROGRESS_WAIT - (end($inProgress) - $inProgress[0]));
+                                          self::IN_PROGRESS_WAIT - max(end($inProgress) - $inProgress[0], $inProgressSlept));
                 if ($s !== null) {   // la primera con esta clave sigue en marcha: se espera y se repite, sin gastar retries
                     $attempt--;
-                    self::pause($s);
+                    static::pause($s);
+                    $inProgressSlept += $s;
                     continue;
                 }
             } elseif (self::retryable($method, $networkError !== "", $http, $j, $idemKey) && $attempt <= $this->retries) {
                 $afterNetwork = $afterNetwork || $networkError !== "" || self::duplicated($http, $j);
-                self::pause(self::retryWait($respHeaders["retry-after"] ?? null, $attempt));
+                static::pause(self::retryWait($respHeaders["retry-after"] ?? null, $attempt));
                 continue;
             }
             if ($networkError !== "") {
@@ -440,8 +442,14 @@ class MundoSMS
         return $s <= $remaining ? $s : null;
     }
 
+    /** Segundos de un reloj que no salta si cambia la hora del sistema (hrtime, desde PHP 7.3); antes, microtime. */
+    protected static function now()
+    {
+        return function_exists("hrtime") ? hrtime(true) / 1e9 : microtime(true);
+    }
+
     /** Espera $s segundos (con decimales). */
-    private static function pause($s)
+    protected static function pause($s)
     {
         if ($s >= 1) sleep((int) $s);
         usleep((int) round(($s - floor($s)) * 1000000));
@@ -473,7 +481,7 @@ class MundoSMS
         return $any ? $out : null;
     }
 
-    /** Si un array es una lista (0, 1, 2…): array_is_list de PHP 8.1, también en 7.4. */
+    /** Si un array es una lista (0, 1, 2…): array_is_list de PHP 8.1, también en 7.0. */
     private static function isList(array $a)
     {
         return $a === array() || array_keys($a) === range(0, count($a) - 1);
